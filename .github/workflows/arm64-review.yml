@@ -1,0 +1,66 @@
+name: ARM64 review build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      NDK_VERSION: '27.2.12479018'
+      RUST_VERSION: '1.100.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install build toolchains
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target aarch64-linux-android
+          sdkmanager 'platforms;android-35' 'build-tools;36.0.0' "ndk;$NDK_VERSION" < <(yes)
+      - name: Test and compile Rust
+        run: |
+          cargo +"$RUST_VERSION" test --locked
+          cargo +"$RUST_VERSION" test --locked sticky_listener_pins_one_init_and_rejects_cross_epoch_upgrade -- --ignored
+          ndk="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ndk/aarch64-linux-android24-clang"
+          export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+          export AR_aarch64_linux_android="$ndk/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-Clink-arg=-Wl,-z,max-page-size=16384 -Clink-arg=-Wl,-z,common-page-size=16384"
+          cargo +"$RUST_VERSION" build --locked --release --target aarch64-linux-android
+          native=target/aarch64-linux-android/release/libtgwsproxy.so
+          "$ndk/llvm-readelf" -h "$native" | grep -q AArch64
+          install -D "$native" build/generated/tgwsNative/arm64-v8a/libtgwsproxy.so
+      - name: Package and verify the debug candidate
+        run: |
+          java -classpath gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain \
+            --no-daemon :app:assembleArm64Debug :app:testArm64DebugUnitTest
+          apk=app/build/outputs/apk/arm64/debug/app-arm64-debug.apk
+          embedded=$(unzip -p "$apk" lib/arm64-v8a/libtgwsproxy.so | sha256sum | cut -d' ' -f1)
+          native=$(sha256sum build/generated/tgwsNative/arm64-v8a/libtgwsproxy.so | cut -d' ' -f1)
+          test "$embedded" = "$native"
+          mkdir review
+          cp "$apk" review/tgws-rust-arm64-debug.apk
+          cp LICENSE LICENSE-Flowseal review/
+          (
+            cd review
+            sha256sum tgws-rust-arm64-debug.apk > SHA256SUMS
+            printf 'source=%s\nnative_sha256=%s\nndk=%s\n' "$GITHUB_SHA" "$native" "$NDK_VERSION" > provenance.txt
+            rustc +"$RUST_VERSION" --version >> provenance.txt
+            java -version 2>> provenance.txt
+            "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs tgws-rust-arm64-debug.apk >> provenance.txt
+          )
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: tgws-rust-arm64-review
+          path: review/
+          if-no-files-found: error
+          retention-days: 7

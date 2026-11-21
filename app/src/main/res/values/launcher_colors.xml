@@ -1,0 +1,5 @@
+<resources>
+    <color name="launcher_fold_background">#15161B</color>
+    <color name="launcher_relay_background">#18233B</color>
+    <color name="launcher_grid_background">#251B36</color>
+</resources>
