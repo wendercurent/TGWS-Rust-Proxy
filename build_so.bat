@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo === Building Rust proxy library for Android (cdylib) ===
-echo === Architectures: arm64-v8a (SDK 24), armeabi-v7a (SDK 21) ===
+echo === Architectures: arm64-v8a (SDK 21, 16KB), armeabi-v7a (SDK 21) ===
 echo.
 
 set "ROOT_DIR=%~dp0"
@@ -42,7 +42,7 @@ set "ANDROID_NDK_HOME=%NDK_ROOT%\%NDK_VER%"
 set "NDK_HOME=%ANDROID_NDK_HOME%"
 set "NDK_BIN=%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64\bin"
 
-if not exist "%NDK_BIN%\aarch64-linux-android24-clang.cmd" (
+if not exist "%NDK_BIN%\aarch64-linux-android21-clang.cmd" (
     echo Error: NDK clang wrapper not found at %NDK_BIN%
     exit /b 1
 )
@@ -70,8 +70,8 @@ if /I not "%~1"=="--arm64-only" (
     if errorlevel 1 exit /b 1
 )
 
-set "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=%NDK_BIN%\aarch64-linux-android24-clang.cmd"
-set "CC_aarch64_linux_android=%NDK_BIN%\aarch64-linux-android24-clang.cmd"
+set "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=%NDK_BIN%\aarch64-linux-android21-clang.cmd"
+set "CC_aarch64_linux_android=%NDK_BIN%\aarch64-linux-android21-clang.cmd"
 set "AR_aarch64_linux_android=%NDK_BIN%\llvm-ar.exe"
 
 set "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=%NDK_BIN%\armv7a-linux-androideabi21-clang.cmd"

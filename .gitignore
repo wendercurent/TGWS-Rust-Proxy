@@ -1,4 +1,4 @@
-# Локальный референс-оригинал (не коммитим)
+# Локальный референс-оригинал 
 tg-ws-proxy-main/
 
 # Gradle / Android build outputs
@@ -14,10 +14,10 @@ captures/
 *.aab
 *.ap_
 
-# Native libs собираются из Rust через build_so.bat / CI — не коммитим бинарники
+# Native libs собираются из Rust через build_so.bat / CI 
 app/src/main/jniLibs/
 
-# Локальная конфигурация и секреты — НЕ коммитить
+# Локальная конфигурация и секреты 
 local.properties
 *.jks
 *.keystore
@@ -30,7 +30,7 @@ gradle/gradle-daemon-jvm.properties
 target/
 **/*.rs.bk
 
-# Local device diagnostics — never commit raw logs
+# Local device diagnostics 
 artifacts/
 
 # IDE / OS

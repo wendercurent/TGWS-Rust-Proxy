@@ -129,6 +129,8 @@ class ProxyService : Service() {
         val startupError: StateFlow<String?> = _startupError
         private val _sessionTraffic = MutableStateFlow<ProxySessionTraffic?>(null)
         internal val sessionTraffic: StateFlow<ProxySessionTraffic?> = _sessionTraffic
+        private val _networkAvailable = MutableStateFlow(true)
+        val networkAvailable: StateFlow<Boolean> = _networkAvailable
         private val _ws80SuggestionActive = MutableStateFlow(false)
         val ws80SuggestionActive: StateFlow<Boolean> = _ws80SuggestionActive
         @Volatile
@@ -168,6 +170,7 @@ class ProxyService : Service() {
     private fun reportDefaultNetwork() {
         if (destroyed || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
         val active = connectivity.activeNetwork
+        _networkAvailable.value = active != null
         val capabilities = connectivity.getNetworkCapabilities(active)
         val transport = when {
             active == null -> 0

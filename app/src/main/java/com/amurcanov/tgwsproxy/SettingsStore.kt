@@ -66,6 +66,7 @@ class SettingsStore(private val context: Context) {
         val DIRECT_DC_DEFAULTS_V2_MIGRATED = booleanPreferencesKey("direct_dc_defaults_v2_migrated")
         val WS80_SUGGESTION_DISMISSED_UNTIL = longPreferencesKey("ws80_suggestion_dismissed_until")
         val WS80_SUGGESTION_NEVER = booleanPreferencesKey("ws80_suggestion_never")
+        val DEVELOPER_MODE = booleanPreferencesKey("developer_mode")
     }
 
     val isReady: Flow<Boolean> = context.dataStore.data.map { true }
@@ -118,6 +119,11 @@ class SettingsStore(private val context: Context) {
     val updateDialogLastActionAt: Flow<Long> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
     val ws80SuggestionDismissedUntil: Flow<Long> = context.dataStore.data.map { it[Keys.WS80_SUGGESTION_DISMISSED_UNTIL] ?: 0L }
     val ws80SuggestionNever: Flow<Boolean> = context.dataStore.data.map { it[Keys.WS80_SUGGESTION_NEVER] ?: false }
+    val developerMode: Flow<Boolean> = context.dataStore.data.map { it[Keys.DEVELOPER_MODE] ?: false }
+
+    suspend fun saveDeveloperMode(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.DEVELOPER_MODE] = enabled }
+    }
 
     suspend fun dismissWs80SuggestionUntil(untilMs: Long) {
         context.dataStore.edit { it[Keys.WS80_SUGGESTION_DISMISSED_UNTIL] = untilMs }

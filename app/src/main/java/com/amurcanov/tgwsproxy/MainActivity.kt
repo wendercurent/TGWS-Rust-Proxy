@@ -193,12 +193,19 @@ fun MainContent(settingsStore: SettingsStore, openWs80RequestId: Int = 0) {
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
     val currentUpdatePostponeUntil by rememberUpdatedState(updatePostponeUntil)
     val currentUpdatePostponeVersion by rememberUpdatedState(updatePostponeVersion)
-    val navItems = remember {
-        if (BuildConfig.DEBUG) NavItem.entries else NavItem.entries.filterNot { it == NavItem.Logs }
+    val developerMode by settingsStore.developerMode.collectAsStateWithLifecycle(initialValue = false)
+    val navItems = remember(developerMode) {
+        if (developerMode) NavItem.entries else NavItem.entries.filterNot { it == NavItem.Logs }
     }
     val pager = rememberPagerState { navItems.size }
     val savedTabs = rememberSaveableStateHolder()
     val settingsTabIndex = remember(navItems) { navItems.indexOf(NavItem.Settings).coerceAtLeast(0) }
+
+    LaunchedEffect(navItems.size) {
+        if (pager.currentPage >= navItems.size) {
+            pager.scrollToPage((navItems.size - 1).coerceAtLeast(0))
+        }
+    }
 
     LaunchedEffect(effectiveWs80RequestId) {
         if (effectiveWs80RequestId > 0) {
@@ -209,11 +216,13 @@ fun MainContent(settingsStore: SettingsStore, openWs80RequestId: Int = 0) {
     val keyboardVisible = WindowInsets.ime.getBottom(density) > 0
     val navOverlayReserve = safeBottomInset + 86.dp
 
-    if (BuildConfig.DEBUG) {
-        DisposableEffect(Unit) {
+    DisposableEffect(developerMode) {
+        if (developerMode) {
             LogManager.startListening()
-            onDispose { LogManager.stopListening() }
+        } else {
+            LogManager.stopListening()
         }
+        onDispose { LogManager.stopListening() }
     }
 
     LaunchedEffect(updateCheckIntervalHours, updateLastCheckAt) {

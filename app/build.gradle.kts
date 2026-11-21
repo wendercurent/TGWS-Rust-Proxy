@@ -16,10 +16,12 @@ val productionId = branding.getProperty("APPLICATION_ID").trim()
 val production = providers.gradleProperty("tgwsProduction").map(String::toBoolean).getOrElse(false)
 val releasePreview = providers.gradleProperty("tgwsReleasePreview").map(String::toBoolean).getOrElse(false)
 val versionNameDefault = "1.0.0"
-val versionCodeDefault = 124
+val versionCodeDefault = 1250
 val releaseVersionCode = providers.gradleProperty("tgwsReleaseVersionCode")
     .map(String::toInt).getOrElse(versionCodeDefault)
 val releaseVersionName = providers.gradleProperty("tgwsReleaseVersionName").getOrElse(versionNameDefault)
+val playAbiVersionCodes = providers.gradleProperty("tgwsPlayAbiVersionCodes")
+    .map(String::toBoolean).getOrElse(false)
 val developmentId = "com.amurcanov.tgwsproxy"
 
 require(!production || !releasePreview) { "Choose either production or unsigned release preview" }
@@ -36,8 +38,11 @@ if (production) {
         "Set RELEASE_REPO to the verified owner/repository in branding.properties"
     }
     require(productionId.matches(Regex("[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+")) &&
-        !productionId.startsWith("$developmentId") && !productionId.endsWith(".rustdev")) {
-        "Set a distinct APPLICATION_ID under a namespace you control"
+        !productionId.startsWith(developmentId) &&
+        !productionId.endsWith(".rustdev") &&
+        !productionId.endsWith(".debug") &&
+        !productionId.contains("releasepreview")) {
+        "Set a final production APPLICATION_ID in branding.properties (not releasepreview/rustdev/upstream)"
     }
 }
 
@@ -64,10 +69,12 @@ android {
     }
 
     flavorDimensions.add("arch")
+    val baseVersionCode = if (production) releaseVersionCode else versionCodeDefault
     productFlavors {
         create("arm32") {
             dimension = "arch"
             minSdk = 21
+            versionCode = if (playAbiVersionCodes) baseVersionCode * 10 + 2 else baseVersionCode
             ndk {
                 abiFilters.clear()
                 abiFilters.add("armeabi-v7a")
@@ -75,7 +82,9 @@ android {
         }
         create("arm64") {
             dimension = "arch"
-            minSdk = 24
+            // Linked against NDK API 21 with 16 KB ELF page alignment.
+            minSdk = 21
+            versionCode = if (playAbiVersionCodes) baseVersionCode * 10 + 3 else baseVersionCode
             ndk {
                 abiFilters.clear()
                 abiFilters.add("arm64-v8a")
@@ -83,8 +92,9 @@ android {
         }
         create("universal") {
             dimension = "arch"
-            // The ARM64 library is linked against NDK API 24.
-            minSdk = 24
+            // Both arm64-v8a and armeabi-v7a libraries are linked against NDK API 21.
+            minSdk = 21
+            versionCode = if (playAbiVersionCodes) baseVersionCode * 10 + 1 else baseVersionCode
             ndk {
                 abiFilters.clear()
                 abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
@@ -98,24 +108,28 @@ android {
         localProperties.load(localPropertiesFile.inputStream())
     }
 
+    fun signingValue(propKey: String, envKey: String): String? =
+        localProperties.getProperty(propKey)?.trim()?.takeIf { it.isNotEmpty() }
+            ?: System.getenv(envKey)?.trim()?.takeIf { it.isNotEmpty() }
+
+    val configuredKeyFile = signingValue("KEYSTORE_FILE", "TGWS_KEYSTORE_FILE")
+    val resolvedKeystoreFile = configuredKeyFile?.let { path ->
+        if (path.startsWith("..")) file(rootDir.resolve(path.substring(3))) else file(path)
+    }
+    val configuredStorePassword = signingValue("KEYSTORE_PASSWORD", "TGWS_KEYSTORE_PASSWORD")
+    val configuredKeyAlias = signingValue("KEY_ALIAS", "TGWS_KEY_ALIAS")
+    val configuredKeyPassword = signingValue("KEY_PASSWORD", "TGWS_KEY_PASSWORD")
+
     signingConfigs {
         create("release") {
-            val keyFile = localProperties.getProperty("KEYSTORE_FILE")
-            if (keyFile != null) {
-                // Резолвим путь: если начинается с "..", берём от корня проекта
-                val resolvedFile = if (keyFile.startsWith("..")) {
-                    // ../release.keystore -> корень проекта / release.keystore
-                    file(rootDir.resolve(keyFile.substring(3)))
+            if (resolvedKeystoreFile != null) {
+                if (resolvedKeystoreFile.isFile) {
+                    storeFile = resolvedKeystoreFile
+                    storePassword = configuredStorePassword
+                    keyAlias = configuredKeyAlias
+                    keyPassword = configuredKeyPassword
                 } else {
-                    file(keyFile)
-                }
-                if (resolvedFile.exists()) {
-                    storeFile = resolvedFile
-                    storePassword = localProperties.getProperty("KEYSTORE_PASSWORD")
-                    keyAlias = localProperties.getProperty("KEY_ALIAS")
-                    keyPassword = localProperties.getProperty("KEY_PASSWORD")
-                } else {
-                    println("WARNING: Keystore file not found: $keyFile (resolved: ${resolvedFile.absolutePath})")
+                    println("WARNING: Keystore file not found: $configuredKeyFile (resolved: ${resolvedKeystoreFile.absolutePath})")
                 }
             }
             enableV1Signing = true
@@ -140,17 +154,14 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            val keyFile = localProperties.getProperty("KEYSTORE_FILE")
-            val resolvedFile = if (keyFile != null && keyFile.startsWith("..")) {
-                file(rootDir.resolve(keyFile.substring(3)))
-            } else if (keyFile != null) {
-                file(keyFile)
-            } else null
-            
             if (production) {
-                require(resolvedFile?.isFile == true && listOf("KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD")
-                    .all { !localProperties.getProperty(it).isNullOrBlank() }) {
-                    "Production requires a private release keystore and all signing properties"
+                require(
+                    resolvedKeystoreFile?.isFile == true &&
+                        !configuredStorePassword.isNullOrBlank() &&
+                        !configuredKeyAlias.isNullOrBlank() &&
+                        !configuredKeyPassword.isNullOrBlank()
+                ) {
+                    "Production release requires a private keystore via local.properties (KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD) or env vars (TGWS_KEYSTORE_FILE, TGWS_KEYSTORE_PASSWORD, TGWS_KEY_ALIAS, TGWS_KEY_PASSWORD)."
                 }
                 signingConfig = signingConfigs.getByName("release")
             }
@@ -202,7 +213,6 @@ dependencies {
 
     // JNA for easy C-shared library calls
     implementation("net.java.dev.jna:jna:5.14.0@aar")
-    debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.appcompat:appcompat:1.6.1")
     testImplementation("junit:junit:4.13.2")

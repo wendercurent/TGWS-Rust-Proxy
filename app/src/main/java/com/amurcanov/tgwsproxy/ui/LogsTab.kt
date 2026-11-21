@@ -96,9 +96,20 @@ fun LogsTab(settingsStore: SettingsStore) {
                     Icon(Icons.Default.Delete, contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.clear), tint = MaterialTheme.colorScheme.primary)
                 }
                 IconButton(onClick = {
-                    val text = filteredLogs.joinToString("\n") { "${LogPrivacy.redact(it.message)} (x${it.count})" }
+                    val diag = runCatching { com.amurcanov.tgwsproxy.NativeProxy.routeDiagnostics() }.getOrNull().orEmpty()
+                    val header = buildString {
+                        appendLine("TG WS Proxy Diagnostic Report")
+                        appendLine("Version: ${com.amurcanov.tgwsproxy.BuildConfig.VERSION_NAME} (${com.amurcanov.tgwsproxy.BuildConfig.VERSION_CODE})")
+                        appendLine("Android SDK: ${android.os.Build.VERSION.SDK_INT}, ABI: ${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"}")
+                        appendLine("State: ${com.amurcanov.tgwsproxy.ProxyService.connectionState.value}, NetworkAvailable: ${com.amurcanov.tgwsproxy.ProxyService.networkAvailable.value}")
+                        if (diag.isNotBlank()) {
+                            appendLine("Route: ${LogPrivacy.redact(diag)}")
+                        }
+                        appendLine("---")
+                    }
+                    val body = filteredLogs.joinToString("\n") { "${LogPrivacy.redact(it.message)} (x${it.count})" }
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    val clip = ClipData.newPlainText("TgWsProxy Logs", text)
+                    val clip = ClipData.newPlainText("TgWsProxy Diagnostic Report", header + body)
                     clipboard.setPrimaryClip(clip)
                     Toast.makeText(context, context.getString(com.amurcanov.tgwsproxy.R.string.copied), Toast.LENGTH_SHORT).show()
                 }) {

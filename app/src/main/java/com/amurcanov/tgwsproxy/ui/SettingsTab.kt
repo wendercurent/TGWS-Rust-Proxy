@@ -102,6 +102,7 @@ fun SettingsTab(settingsStore: SettingsStore, openWs80RequestId: Int = 0) {
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
     val savedCustomDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
     val savedCustomDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
+    val developerMode by settingsStore.developerMode.collectAsStateWithLifecycle(initialValue = false)
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
@@ -521,6 +522,33 @@ fun SettingsTab(settingsStore: SettingsStore, openWs80RequestId: Int = 0) {
                     checked = autoStartOnBoot,
                     onCheckedChange = { enabled ->
                         scope.launch { settingsStore.saveAutoStartOnBoot(enabled) }
+                    }
+                )
+            }
+        }
+        AppSectionCard {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        stringResource(R.string.settings_developer_mode),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        stringResource(R.string.settings_developer_mode_help),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = developerMode,
+                    onCheckedChange = { enabled ->
+                        scope.launch { settingsStore.saveDeveloperMode(enabled) }
                     }
                 )
             }

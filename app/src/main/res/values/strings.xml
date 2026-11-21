@@ -248,4 +248,14 @@
     <string name="maintained_by">Maintained by %1$s</string>
     <string name="open_support">Open project support</string>
     <string name="report_error_count">Warnings and errors in the local log: %1$d</string>
+    <string name="status_user_disconnected">Not connected</string>
+    <string name="status_user_connecting">Connecting…</string>
+    <string name="status_user_connected">Connected</string>
+    <string name="status_user_reconnecting">Reconnecting…</string>
+    <string name="status_user_no_network">No network access</string>
+    <string name="status_user_no_network_hint">Check Wi-Fi or mobile data</string>
+    <string name="status_user_failed">Connection failed</string>
+    <string name="status_user_failed_hint">Try starting again or check network settings</string>
+    <string name="settings_developer_mode">Developer mode</string>
+    <string name="settings_developer_mode_help">Shows advanced logs, route diagnostics, and report export</string>
 </resources>

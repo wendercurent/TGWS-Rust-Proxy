@@ -97,32 +97,42 @@ fun ConnectionTab(
     var dispatchError by remember { mutableStateOf<String?>(null) }
     var applyMode by rememberSaveable { mutableStateOf("packages") }
     val sessionTraffic by ProxyService.sessionTraffic.collectAsStateWithLifecycle()
+    val networkAvailable by ProxyService.networkAvailable.collectAsStateWithLifecycle()
 
     val active = dispatching || starting || isRunning
     val error = dispatchError ?: startupError
     val status = when {
-        dispatching || starting -> stringResource(R.string.flight_starting)
+        dispatching || starting -> stringResource(R.string.status_user_connecting)
         stopping -> stringResource(R.string.flight_stopping)
-        !active && error != null -> error
-        !active -> stringResource(R.string.flight_off)
+        !active && error != null -> stringResource(R.string.status_user_failed)
+        !active -> stringResource(R.string.status_user_disconnected)
+        !networkAvailable -> stringResource(R.string.status_user_no_network)
         else -> when (connectionState) {
-            ProxyConnectionState.LISTENING, ProxyConnectionState.DEGRADED -> stringResource(R.string.flight_listening)
-            ProxyConnectionState.RELAYING_BYTES -> stringResource(R.string.flight_traffic)
-            else -> stringResource(connectionState.label)
+            ProxyConnectionState.CONNECTING -> stringResource(R.string.status_user_connecting)
+            ProxyConnectionState.DEGRADED -> stringResource(R.string.status_user_reconnecting)
+            ProxyConnectionState.NO_AVAILABLE_ROUTE -> stringResource(R.string.status_user_failed)
+            ProxyConnectionState.LISTENING,
+            ProxyConnectionState.UPSTREAM_VERIFIED,
+            ProxyConnectionState.RELAYING_BYTES -> stringResource(R.string.status_user_connected)
+            ProxyConnectionState.STOPPED -> stringResource(R.string.status_user_disconnected)
         }
     }
     val colors = MaterialTheme.colorScheme
     val statusColor = when {
         !active && error != null -> colors.error
+        active && !networkAvailable -> colors.error
         !ready -> colors.onSurface
         connectionState == ProxyConnectionState.NO_AVAILABLE_ROUTE -> colors.error
         connectionState == ProxyConnectionState.RELAYING_BYTES -> colors.primary
         else -> colors.onSurface
     }
-    val statusDetail = if (ready && !stopping) when (connectionState) {
-        ProxyConnectionState.NO_AVAILABLE_ROUTE -> stringResource(R.string.info_routes_unavailable_hint)
+    val statusDetail = when {
+        !active && error != null -> stringResource(R.string.status_user_failed_hint)
+        ready && !stopping && !networkAvailable -> stringResource(R.string.status_user_no_network_hint)
+        ready && !stopping && connectionState == ProxyConnectionState.NO_AVAILABLE_ROUTE ->
+            stringResource(R.string.info_routes_unavailable_hint)
         else -> null
-    } else null
+    }
 
     val port = savedPort.toIntOrNull() ?: 1443
     val bindIp = savedBindIp.trim().ifEmpty { "127.0.0.1" }

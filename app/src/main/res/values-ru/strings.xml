@@ -248,4 +248,14 @@
     <string name="maintained_by">Сопровождение: %1$s</string>
     <string name="open_support">Открыть поддержку проекта</string>
     <string name="report_error_count">Предупреждений и ошибок в локальном журнале: %1$d</string>
+    <string name="status_user_disconnected">Не подключено</string>
+    <string name="status_user_connecting">Подключение…</string>
+    <string name="status_user_connected">Подключено</string>
+    <string name="status_user_reconnecting">Восстановление соединения…</string>
+    <string name="status_user_no_network">Нет доступа к сети</string>
+    <string name="status_user_no_network_hint">Проверьте Wi-Fi или мобильный интернет</string>
+    <string name="status_user_failed">Не удалось подключиться</string>
+    <string name="status_user_failed_hint">Попробуйте включить снова или проверьте настройки сети</string>
+    <string name="settings_developer_mode">Режим разработчика</string>
+    <string name="settings_developer_mode_help">Показывает расширенные логи, диагностику маршрута и копирование отчёта</string>
 </resources>
