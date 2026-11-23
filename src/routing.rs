@@ -267,6 +267,23 @@ enum FamilyAttempt {
     Probe,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SkipReason {
+    NetworkChanged,
+    RouteCooling,
+    RouteProbing,
+    FamilyCooling,
+    FamilyBudget,
+}
+
+#[derive(Clone)]
+struct ExhaustedEntry {
+    at: Instant,
+    reason: &'static str,
+    candidates: usize,
+    attempts: u32,
+}
+
 pub(crate) struct Manager {
     policy: Policy,
     health: HashMap<(Scope, Candidate), Health>,
@@ -277,6 +294,7 @@ pub(crate) struct Manager {
     last_payload: Option<(u64, Instant)>,
     changes: VecDeque<(u64, serde_json::Value)>,
     family: HashMap<(u64, Route), Family>,
+    exhausted: HashMap<Scope, ExhaustedEntry>,
 }
 
 impl Default for Manager {
@@ -293,6 +311,7 @@ impl Default for Manager {
             hints,
             path,
             family: HashMap::new(),
+            exhausted: HashMap::new(),
             ..Self::with_policy(Policy::default())
         }
     }
@@ -310,6 +329,7 @@ impl Manager {
             last_payload: None,
             changes: VecDeque::new(),
             family: HashMap::new(),
+            exhausted: HashMap::new(),
         }
     }
 
@@ -332,6 +352,10 @@ impl Manager {
         });
         self.changes.retain(|(epoch, _)| *epoch == scope.epoch);
         self.family.retain(|(epoch, _), _| *epoch == scope.epoch);
+        self.exhausted.retain(|key, entry| {
+            key.epoch == scope.epoch
+                && now.saturating_duration_since(entry.at) <= Duration::from_secs(60)
+        });
         if !automatic {
             return;
         }
@@ -468,21 +492,22 @@ impl Manager {
         scope: Scope,
         candidate: &Candidate,
         now: Instant,
-    ) -> Option<(bool, Option<FamilyAttempt>)> {
+    ) -> Result<(bool, Option<FamilyAttempt>), SkipReason> {
         let family_key = (scope.epoch, candidate.kind);
+        let has_healthy = matches!(candidate.kind, Route::CfWss | Route::WorkerWss)
+            && self.has_healthy_route(scope.epoch, candidate.kind);
         let attempt = if matches!(candidate.kind, Route::CfWss | Route::WorkerWss) {
             let family = self.family.entry(family_key).or_default();
             if let Some(until) = family.open_until {
                 if now < until || family.in_flight != 0 {
-                    return None;
+                    return Err(SkipReason::FamilyCooling);
                 }
                 Some(FamilyAttempt::Probe)
+            } else if !has_healthy && family.consecutive + family.in_flight >= FAMILY_THRESHOLD {
+                // Only gate concurrent dials against the failure budget while no
+                // endpoint in this family has proven healthy on the current epoch.
+                return Err(SkipReason::FamilyBudget);
             } else {
-                // Each outstanding dial can still fail. Reserve against the
-                // remaining failure budget before starting network work.
-                if family.consecutive + family.in_flight >= FAMILY_THRESHOLD {
-                    return None;
-                }
                 Some(FamilyAttempt::Dial)
             }
         } else {
@@ -490,9 +515,9 @@ impl Manager {
         };
         let route_probe = self.start_route(scope, candidate, now)?;
         if let Some(family) = self.family.get_mut(&family_key) {
-            family.in_flight += 1;
+            family.in_flight = family.in_flight.saturating_add(1);
         }
-        Some((route_probe, attempt))
+        Ok((route_probe, attempt))
     }
 
     // A normal dial is settled at Upgrade. Only a half-open probe owns the
@@ -560,7 +585,7 @@ impl Manager {
         })
     }
 
-    fn start_route(&mut self, scope: Scope, candidate: &Candidate, now: Instant) -> Option<bool> {
+    fn start_route(&mut self, scope: Scope, candidate: &Candidate, now: Instant) -> Result<bool, SkipReason> {
         if !self.health.contains_key(&(scope, candidate.clone())) && self.health.len() >= MAX_ROUTES
         {
             let oldest = self
@@ -568,19 +593,23 @@ impl Manager {
                 .iter()
                 .filter(|(_, health)| !health.probing)
                 .min_by_key(|(_, health)| health.updated)
-                .map(|(key, _)| key.clone())?;
+                .map(|(key, _)| key.clone())
+                .ok_or(SkipReason::RouteProbing)?;
             self.health.remove(&oldest);
         }
         let state = self
             .health
             .entry((scope, candidate.clone()))
             .or_insert_with(|| Health::new(now));
-        if state.probing || state.cooldown.is_some_and(|until| until > now) {
-            return None;
+        if state.probing {
+            return Err(SkipReason::RouteProbing);
+        }
+        if state.cooldown.is_some_and(|until| until > now) {
+            return Err(SkipReason::RouteCooling);
         }
         state.probing = state.probation;
         state.updated = now;
-        Some(state.probing)
+        Ok(state.probing)
     }
 
     fn record(
@@ -609,6 +638,7 @@ impl Manager {
                 state.probation = false;
                 state.response = true;
                 self.last_payload = Some((scope.epoch, now));
+                self.exhausted.remove(&scope);
                 if evidence == Evidence::Sustained {
                     state.sustained = state.sustained.saturating_add(1).min(8);
                 }
@@ -779,6 +809,39 @@ impl Manager {
         );
     }
 
+    pub(crate) fn record_exhausted(
+        &mut self,
+        scope: Scope,
+        reason: &'static str,
+        candidates: usize,
+        attempts: u32,
+        now: Instant,
+    ) {
+        self.exhausted.retain(|key, entry| {
+            key.epoch == scope.epoch
+                && now.saturating_duration_since(entry.at) <= Duration::from_secs(60)
+        });
+        if self.exhausted.len() >= 16 && !self.exhausted.contains_key(&scope) {
+            if let Some(oldest) = self
+                .exhausted
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(key, _)| *key)
+            {
+                self.exhausted.remove(&oldest);
+            }
+        }
+        self.exhausted.insert(
+            scope,
+            ExhaustedEntry {
+                at: now,
+                reason,
+                candidates,
+                attempts,
+            },
+        );
+    }
+
     pub(crate) fn diagnostics(&self, epoch: u64, now: Instant) -> serde_json::Value {
         let mut routes: Vec<_> = self.preferred.iter()
             .filter(|(scope, pref)| scope.epoch == epoch && now.saturating_duration_since(pref.evidence) <= self.policy.preference_ttl)
@@ -792,6 +855,30 @@ impl Manager {
                 })))
             }).collect();
         routes.sort_by_key(|(dc, media, _)| (*dc, *media));
+        let mut exhausted: Vec<_> = self
+            .exhausted
+            .iter()
+            .filter(|(scope, entry)| {
+                scope.epoch == epoch
+                    && now.saturating_duration_since(entry.at) <= Duration::from_secs(60)
+            })
+            .map(|(scope, entry)| {
+                (
+                    scope.dc.dc,
+                    scope.dc.is_media != 0,
+                    serde_json::json!({
+                        "dc": scope.dc.dc,
+                        "media": scope.dc.is_media != 0,
+                        "test": scope.dc.is_test != 0,
+                        "reason": entry.reason,
+                        "candidates": entry.candidates,
+                        "attempts": entry.attempts,
+                        "ageSeconds": now.saturating_duration_since(entry.at).as_secs(),
+                    }),
+                )
+            })
+            .collect();
+        exhausted.sort_by_key(|(dc, media, _)| (*dc, *media));
         let secure_failures: u32 = self
             .health
             .iter()
@@ -812,6 +899,7 @@ impl Manager {
             "lastChange": self.changes.iter().find(|(seen_epoch, _)| *seen_epoch == epoch)
                 .map(|(_, entry)| entry),
             "routes": routes.into_iter().take(12).map(|(_, _, entry)| entry).collect::<Vec<_>>(),
+            "exhausted": exhausted.into_iter().take(12).map(|(_, _, entry)| entry).collect::<Vec<_>>(),
             "cloudflare": self.family_diag(epoch, Route::CfWss, now),
             "worker": self.family_diag(epoch, Route::WorkerWss, now),
             "directDegraded": self.direct_is_degraded(epoch, now),
@@ -837,11 +925,11 @@ impl<'a> RouteUse<'a> {
         manager: &'a Mutex<Manager>,
         scope: Scope,
         candidate: &'a Candidate,
-    ) -> Option<Self> {
+    ) -> Result<Self, SkipReason> {
         let now = Instant::now();
         let mut routes = manager.lock();
         if scope.epoch != crate::trace::network() {
-            return None;
+            return Err(SkipReason::NetworkChanged);
         }
         let (route_probe, family) = routes.start(scope, candidate, now)?;
         if route_probe || family == Some(FamilyAttempt::Probe) {
@@ -854,7 +942,7 @@ impl<'a> RouteUse<'a> {
                 ),
             );
         }
-        Some(Self {
+        Ok(Self {
             manager,
             scope,
             candidate,
@@ -878,14 +966,23 @@ impl<'a> RouteUse<'a> {
         if self.scope.epoch != crate::trace::network() {
             return;
         }
-        let outcome = match (self.family, evidence) {
-            (_, Evidence::DialFailure | Evidence::PeerFailure | Evidence::ResponseTimeout | Evidence::TransportError(_)) => Some(class),
-            (Some(FamilyAttempt::Dial), Evidence::TransportVerified | Evidence::Reachable)
-            | (_, Evidence::ProtocolResponse | Evidence::Sustained) => Some(FailureClass::None),
-            _ => None,
-        };
-        if outcome.is_some() && self.family.take().is_some() {
-            manager.finish_family(self.scope, self.candidate.kind, outcome, now);
+        // Per-DC/per-role MTProto TransportError (e.g. -404) proves the underlying
+        // transport reached Telegram; it must only degrade this (Scope, Candidate)
+        // and must NOT open the cross-DC family circuit breaker.
+        if matches!(evidence, Evidence::TransportError(_)) {
+            if self.family.take().is_some() {
+                manager.finish_family(self.scope, self.candidate.kind, None, now);
+            }
+        } else {
+            let outcome = match (self.family, evidence) {
+                (_, Evidence::DialFailure | Evidence::PeerFailure | Evidence::ResponseTimeout) => Some(class),
+                (Some(FamilyAttempt::Dial), Evidence::TransportVerified | Evidence::Reachable)
+                | (_, Evidence::ProtocolResponse | Evidence::Sustained) => Some(FailureClass::None),
+                _ => None,
+            };
+            if outcome.is_some() && self.family.take().is_some() {
+                manager.finish_family(self.scope, self.candidate.kind, outcome, now);
+            }
         }
         if matches!(evidence, Evidence::Reachable | Evidence::TransportVerified) {
             if let Some(health) = manager
@@ -976,9 +1073,9 @@ mod tests {
         let tcp = route(Route::Tcp, "");
         let original = [direct.clone(), failed.clone(), fresh.clone(), verified.clone(), tcp.clone()];
 
-        routes.start_route(media, &failed, now);
+        let _ = routes.start_route(media, &failed, now);
         routes.record(media, &failed, Evidence::DialFailure, None, now);
-        routes.start_route(main, &verified, now);
+        let _ = routes.start_route(main, &verified, now);
         routes.record(main, &verified, Evidence::TransportVerified, None, now);
 
         let mut ordered = original.clone();
@@ -998,10 +1095,10 @@ mod tests {
         let media = key(9, true, false);
         let a = route(Route::DirectWss, "kws2-1.web.telegram.org");
         let b = route(Route::DirectWss, "kws2.web.telegram.org");
-        assert_eq!(routes.start(media, &a, now), Some((false, None)));
+        assert_eq!(routes.start(media, &a, now), Ok((false, None)));
         routes.record(media, &a, Evidence::Sustained, None, now);
         routes.record(media, &a, Evidence::DialFailure, None, now);
-        routes.start_route(media, &b, now);
+        let _ = routes.start_route(media, &b, now);
         routes.record(media, &b, Evidence::Sustained, None, now);
         let mut ordered = [b.clone(), a.clone()];
         routes.order(media, &mut ordered, now, true);
@@ -1024,20 +1121,20 @@ mod tests {
         let media = key(9, true, false);
         let a = route(Route::DirectWss, "kws2-1.web.telegram.org");
         let b = route(Route::DirectWss, "kws2.web.telegram.org");
-        assert_eq!(routes.start(media, &a, now), Some((false, None)));
+        assert_eq!(routes.start(media, &a, now), Ok((false, None)));
         routes.record(media, &a, Evidence::ProtocolResponse, None, now);
         for _ in 0..2 {
             routes.record(media, &a, Evidence::DialFailure, None, now);
         }
-        assert_eq!(routes.start(media, &a, now), None);
-        routes.start_route(media, &b, now);
+        assert_eq!(routes.start(media, &a, now), Err(SkipReason::RouteCooling));
+        let _ = routes.start_route(media, &b, now);
         routes.record(media, &b, Evidence::ProtocolResponse, None, now);
         let mut candidates = [a.clone(), b.clone()];
         routes.order(media, &mut candidates, now, true);
         assert_eq!(candidates, [b, a.clone()]);
         let after = now + Duration::from_secs(3);
-        assert_eq!(routes.start(media, &a, after), Some((true, None)));
-        assert_eq!(routes.start(media, &a, after), None);
+        assert_eq!(routes.start(media, &a, after), Ok((true, None)));
+        assert_eq!(routes.start(media, &a, after), Err(SkipReason::RouteProbing));
     }
 
     #[test]
@@ -1051,7 +1148,7 @@ mod tests {
         let worker = route(Route::WorkerWss, "worker.example");
         let tcp = route(Route::Tcp, "");
 
-        routes.start_route(scope, &preferred_cf, now);
+        let _ = routes.start_route(scope, &preferred_cf, now);
         routes.record(scope, &preferred_cf, Evidence::ProtocolResponse, None, now);
         let mut candidates = [direct.clone(), worker.clone(), first_cf.clone(), preferred_cf.clone(), tcp.clone()];
         routes.order(scope, &mut candidates, now, true);
@@ -1065,7 +1162,7 @@ mod tests {
         let media = key(9, true, false);
         let a = route(Route::DirectWss, "kws2-1.web.telegram.org");
         let peer = "127.0.0.1:443".parse().unwrap();
-        routes.start(media, &a, now);
+        let _ = routes.start(media, &a, now);
         routes.record(media, &a, Evidence::TransportVerified, Some(peer), now);
         routes.record(media, &a, Evidence::TransportError(-404), Some(peer), now);
         assert!(routes.preferred.get(&media).is_none());
@@ -1073,7 +1170,7 @@ mod tests {
             routes.health[&(media, a.clone())].endpoints[&peer],
             Evidence::TransportError(-404)
         );
-        assert_eq!(routes.start(media, &a, now), Some((false, None)));
+        assert_eq!(routes.start(media, &a, now), Ok((false, None)));
         assert!(routes.retry_cooled_routes(media.epoch, now));
         assert!(!routes.retry_cooled_routes(media.epoch, now));
     }
@@ -1085,7 +1182,7 @@ mod tests {
         let media = key(9, false, false);
         let a = route(Route::DirectWss, "kws2.web.telegram.org");
         let b = route(Route::CfWss, "kws2.example");
-        routes.start_route(media, &b, now);
+        let _ = routes.start_route(media, &b, now);
         routes.record(media, &b, Evidence::ProtocolResponse, None, now);
         let mut candidates = [a.clone(), b.clone()];
         routes.order(media, &mut candidates, now, false);
@@ -1102,7 +1199,7 @@ mod tests {
         let scope = key(9, false, false);
         let wss = route(Route::DirectWss, "kws2.web.telegram.org");
         let tcp = route(Route::Tcp, "");
-        routes.start(scope, &tcp, now);
+        let _ = routes.start(scope, &tcp, now);
         routes.record(scope, &tcp, Evidence::Sustained, None, now);
         let mut candidates = [wss.clone(), tcp.clone()];
         routes.order(scope, &mut candidates, now, true);
@@ -1135,9 +1232,9 @@ mod tests {
     fn open_family(routes: &mut Manager, scope: Scope, now: Instant) -> Candidate {
         let candidate = route(Route::CfWss, "fallback.example");
         for _ in 0..FAMILY_THRESHOLD {
-            assert_eq!(routes.start(scope, &candidate, now), Some((false, Some(FamilyAttempt::Dial))));
+            assert_eq!(routes.start(scope, &candidate, now), Ok((false, Some(FamilyAttempt::Dial))));
         }
-        assert_eq!(routes.start(scope, &candidate, now), None);
+        assert_eq!(routes.start(scope, &candidate, now), Err(SkipReason::FamilyBudget));
         for _ in 0..FAMILY_THRESHOLD {
             routes.finish_family(scope, candidate.kind, Some(FailureClass::Timeout), now);
         }
@@ -1151,16 +1248,16 @@ mod tests {
         let dc2 = key(9, false, false);
         let dc5 = Scope { dc: DcKey::new(5, false, false), ..dc2 };
         let cf = open_family(&mut routes, dc2, now);
-        assert_eq!(routes.start(dc5, &cf, now), None);
+        assert_eq!(routes.start(dc5, &cf, now), Err(SkipReason::FamilyCooling));
         let direct = route(Route::DirectWss, "kws5.web.telegram.org");
-        assert_eq!(routes.start(dc5, &direct, now), Some((false, None)));
+        assert_eq!(routes.start(dc5, &direct, now), Ok((false, None)));
         let worker = route(Route::WorkerWss, "worker.example");
-        assert_eq!(routes.start(dc5, &worker, now), Some((false, Some(FamilyAttempt::Dial))));
+        assert_eq!(routes.start(dc5, &worker, now), Ok((false, Some(FamilyAttempt::Dial))));
         let new_epoch = Scope { epoch: 17, ..dc5 };
         routes.order(new_epoch, &mut [], now, true);
         // Completion from the previous network no longer has an entry.
         routes.finish_family(dc5, cf.kind, Some(FailureClass::Tls), now);
-        assert_eq!(routes.start(new_epoch, &cf, now), Some((false, Some(FamilyAttempt::Dial))));
+        assert_eq!(routes.start(new_epoch, &cf, now), Ok((false, Some(FamilyAttempt::Dial))));
         assert_eq!(routes.diagnostics(17, now)["cloudflare"]["state"], "closed");
     }
 
@@ -1172,10 +1269,10 @@ mod tests {
         let dc5 = Scope { dc: DcKey::new(5, false, false), ..dc2 };
         let cf = open_family(&mut routes, dc2, now);
         for delay in [4, 8, 16, 32, 64, 64] {
-            assert_eq!(routes.start(dc2, &cf, now + Duration::from_secs(delay - 1)), None);
+            assert_eq!(routes.start(dc2, &cf, now + Duration::from_secs(delay - 1)), Err(SkipReason::FamilyCooling));
             now += Duration::from_secs(delay);
-            assert_eq!(routes.start(dc2, &cf, now), Some((false, Some(FamilyAttempt::Probe))));
-            assert_eq!(routes.start(dc5, &cf, now), None);
+            assert_eq!(routes.start(dc2, &cf, now), Ok((false, Some(FamilyAttempt::Probe))));
+            assert_eq!(routes.start(dc5, &cf, now), Err(SkipReason::FamilyCooling));
             routes.finish_family(dc2, cf.kind, Some(FailureClass::Timeout), now);
         }
     }
@@ -1192,9 +1289,9 @@ mod tests {
         let routes = Mutex::new(routes);
         let probe = RouteUse { manager: &routes, scope, candidate: &cf, route_probe, family, started: after };
         assert!(routes.lock().retry_cooled_routes(scope.epoch, after));
-        assert_eq!(routes.lock().start(scope, &cf, after), None);
+        assert_eq!(routes.lock().start(scope, &cf, after), Err(SkipReason::FamilyCooling));
         drop(probe);
-        assert_eq!(routes.lock().start(scope, &cf, after), Some((false, Some(FamilyAttempt::Probe))));
+        assert_eq!(routes.lock().start(scope, &cf, after), Ok((false, Some(FamilyAttempt::Probe))));
     }
 
     #[test]
@@ -1215,7 +1312,7 @@ mod tests {
                     let scope = Scope { dc: DcKey::new(worker % 5 + 1, false, false), ..scope };
                     barrier.wait();
                     let attempt = routes.lock().start(scope, cf, now + Duration::from_secs(4));
-                    let permit = attempt.map(|(route_probe, family)| {
+                    let permit = attempt.ok().map(|(route_probe, family)| {
                         admitted.fetch_add(1, Ordering::Relaxed);
                         RouteUse { manager: routes, scope, candidate: cf, route_probe, family, started: now }
                     });
@@ -1241,7 +1338,7 @@ mod tests {
         let after = now + Duration::from_secs(4);
         let mut probe = attempt(after);
         probe.observe_at(Evidence::TransportVerified, None, FailureClass::None, after);
-        assert_eq!(routes.lock().start(scope, &cf, after), None);
+        assert_eq!(routes.lock().start(scope, &cf, after), Err(SkipReason::FamilyCooling));
         assert!(routes.lock().preferred.get(&scope).is_none());
         probe.observe_at(Evidence::ResponseTimeout, None, FailureClass::Timeout, after);
         assert_eq!(routes.lock().diagnostics(scope.epoch, after)["cloudflare"]["state"], "open");
@@ -1347,13 +1444,58 @@ mod tests {
         routes.finish_family(scope, Route::CfWss, Some(FailureClass::None), now);
         routes.record(scope, &good, Evidence::ProtocolResponse, None, now);
 
-        // Repeated failures on another CF domain must not pause the CfWss family.
+        // Repeated failures on another CF domain must not pause the CfWss family
+        // or block concurrent dials for other DCs/media roles.
         for _ in 0..6 {
             let _ = routes.start(media, &bad, now);
             routes.finish_family(media, Route::CfWss, Some(FailureClass::Timeout), now);
         }
         assert_eq!(routes.diagnostics(scope.epoch, now)["cloudflare"]["state"], "closed");
-        assert!(routes.start(media, &good, now).is_some());
+        let dc4_media = Scope { epoch: scope.epoch, dc: DcKey::new(4, true, false) };
+        let good_dc4 = Candidate::new(Route::CfWss, "kws4.good.example".into(), "good.example".into(), false);
+        // Two concurrent in-flight dials must both be admitted while healthy CF exists.
+        assert!(routes.start(media, &good, now).is_ok());
+        assert!(routes.start(dc4_media, &good_dc4, now).is_ok());
+    }
+
+    #[test]
+    fn mtproto_transport_error_on_one_dc_never_opens_family_breaker_for_other_dcs() {
+        let now = Instant::now();
+        let epoch = crate::trace::network();
+        let dc1 = Scope { epoch, dc: DcKey::new(1, false, false) };
+        let dc2 = Scope { epoch, dc: DcKey::new(2, false, false) };
+        let cf_dc1 = Candidate::new(Route::CfWss, "kws1.cf.example".into(), "cf.example".into(), true);
+        let cf_dc2 = Candidate::new(Route::CfWss, "kws2.cf.example".into(), "cf.example".into(), true);
+        let routes = Mutex::new(manager());
+
+        for _ in 0..6 {
+            if let Ok(mut ru) = RouteUse::start(&routes, dc1, &cf_dc1) {
+                ru.observe_at(Evidence::TransportError(-404), None, FailureClass::Transport, now);
+            }
+        }
+        assert_eq!(routes.lock().diagnostics(epoch, now)["cloudflare"]["state"], "closed");
+        assert!(RouteUse::start(&routes, dc2, &cf_dc2).is_ok());
+    }
+
+    #[test]
+    fn diagnostics_reports_healthy_dc2_alongside_exhausted_dc1() {
+        let now = Instant::now();
+        let epoch = (3u64 << 3) | 1;
+        let dc1 = Scope { epoch, dc: DcKey::new(1, false, false) };
+        let dc2 = Scope { epoch, dc: DcKey::new(2, false, false) };
+        let direct_dc2 = route(Route::DirectWss, "kws2.web.telegram.org");
+        let mut routes = manager();
+
+        let _ = routes.start(dc2, &direct_dc2, now).unwrap();
+        routes.record(dc2, &direct_dc2, Evidence::ProtocolResponse, None, now);
+        routes.record_exhausted(dc1, "family_cooling", 2, 0, now);
+
+        let diag = routes.diagnostics(epoch, now);
+        assert_eq!(diag["workingRoutes"], 1);
+        assert_eq!(diag["routes"][0]["dc"], 2);
+        assert_eq!(diag["exhausted"][0]["dc"], 1);
+        assert_eq!(diag["exhausted"][0]["reason"], "family_cooling");
+        assert_eq!(diag["exhausted"][0]["attempts"], 0);
     }
 
     #[test]

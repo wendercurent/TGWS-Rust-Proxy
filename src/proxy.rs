@@ -1,5 +1,5 @@
 use crate::trace::{self, Route};
-use crate::routing::{Candidate, Evidence, FailureClass, Manager, RouteUse, Scope};
+use crate::routing::{Candidate, Evidence, FailureClass, Manager, RouteUse, Scope, SkipReason};
 use crate::cfproxy::*;
 use crate::config::*;
 use crate::crypto::*;
@@ -1408,107 +1408,185 @@ async fn serve_core<R, W>(
         candidates.first().map(|candidate| candidate.kind), candidates.len()));
 
     let mut cf_attempts = 0;
-    for candidate in &candidates {
-        if candidate.kind == Route::CfWss && cf_attempts >= CF_ATTEMPTS_PER_SESSION {
-            continue;
-        }
-        let Some(mut route_use) = RouteUse::start(&pools.routes, scope, candidate) else {
-            if scope.epoch != trace::network() { return; }
-            continue;
+    let mut dial_attempts = 0u32;
+    let mut route_cooling = 0u32;
+    let mut route_probing = 0u32;
+    let mut family_cooling = 0u32;
+    let mut family_budget = 0u32;
+    let mut busy_count = 0u32;
+    let mut dial_failed = 0u32;
+    let mut busy_indices: Vec<usize> = Vec::new();
+    let mut pass = 0u8;
+
+    loop {
+        let indices: Vec<usize> = if pass == 0 {
+            (0..candidates.len()).collect()
+        } else {
+            std::mem::take(&mut busy_indices)
         };
-        trace::set_route(candidate.kind);
-        let acquired = tokio::select! {
-            _ = cancel_token.cancelled() => return,
-            _ = trace::network_changed(scope.epoch) => {
+        for idx in indices {
+            let candidate = &candidates[idx];
+            if candidate.kind == Route::CfWss && cf_attempts >= CF_ATTEMPTS_PER_SESSION {
+                continue;
+            }
+            let mut route_use = match RouteUse::start(&pools.routes, scope, candidate) {
+                Ok(route_use) => route_use,
+                Err(SkipReason::NetworkChanged) => return,
+                Err(SkipReason::RouteCooling) => {
+                    route_cooling += 1;
+                    continue;
+                }
+                Err(SkipReason::RouteProbing) => {
+                    route_probing += 1;
+                    continue;
+                }
+                Err(SkipReason::FamilyCooling) => {
+                    family_cooling += 1;
+                    continue;
+                }
+                Err(SkipReason::FamilyBudget) => {
+                    family_budget += 1;
+                    continue;
+                }
+            };
+            trace::set_route(candidate.kind);
+            let acquired = tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                _ = trace::network_changed(scope.epoch) => {
+                    trace::event("route_aborted", format_args!("reason=network_changed"));
+                    return;
+                }
+                result = acquire_candidate(pools, scope, candidate, ws_path) => result,
+            };
+            if scope.epoch != trace::network() {
                 trace::event("route_aborted", format_args!("reason=network_changed"));
                 return;
             }
-            result = acquire_candidate(pools, scope, candidate, ws_path) => result,
-        };
-        if scope.epoch != trace::network() {
-            trace::event("route_aborted", format_args!("reason=network_changed"));
+            let upstream = match acquired {
+                Ok(upstream) => upstream,
+                Err(WsError::NetworkChanged) => return,
+                Err(WsError::Busy) => {
+                    busy_count += 1;
+                    if pass == 0 {
+                        busy_indices.push(idx);
+                    }
+                    continue;
+                }
+                Err(WsError::Canceled) => continue,
+                Err(error) => {
+                    dial_attempts += 1;
+                    dial_failed += 1;
+                    if candidate.kind == Route::CfWss {
+                        cf_attempts += 1;
+                    }
+                    STATS.ws_errors.fetch_add(i64::from(candidate.kind != Route::Tcp), Ordering::Relaxed);
+                    trace::event("candidate_failed", format_args!("kind={:?} host={} error={} class={}",
+                        candidate.kind, trace::allowlisted_host(&candidate.host), error.compact(),
+                        connect_failure_class(&error).as_str()));
+                    route_use.observe_connect_failure(connect_failure_class(&error));
+                    continue;
+                }
+            };
+
+            // After the first write is attempted the init may already be partially on
+            // the wire. All exits below close this client and never use another route.
+            match upstream {
+                Upstream::WebSocket(ws) => {
+                    if ws.network != scope.epoch || scope.epoch != trace::network() {
+                        return;
+                    }
+                    let peer = ws.peer;
+                    route_use.observe(if ws.secure { Evidence::TransportVerified } else { Evidence::Reachable }, peer);
+                    if ws.send(&relay_init).await.is_err() {
+                        route_use.observe(Evidence::PeerFailure, peer);
+                        trace::event("relay_init_failed", format_args!("reason=write"));
+                        return;
+                    }
+                    trace::mark_verified();
+                    trace::event("relay_init_sent", format_args!("route={:?} dc={dc} media={is_media}", candidate.kind));
+                    trace::event("route_pinned", format_args!("kind={:?} host={} dc={dc} media={is_media} test={is_test_dc}",
+                        candidate.kind, trace::allowlisted_host(&candidate.host)));
+                    let splitter = if candidate.kind == Route::WorkerWss { None } else { MsgSplitter::new(&relay_init, proto_int) };
+                    if candidate.kind == Route::DirectWss {
+                        STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let probe_timeout = Some(FIRST_RESPONSE_TIMEOUT);
+                    bridge_ws(conn_read, conn_write, ws, label, dc, is_media, splitter,
+                        clt_decryptor, clt_encryptor, tg_encryptor, tg_decryptor, cancel_token, probe_timeout,
+                        |evidence| {
+                            route_use.observe(evidence, peer);
+                            if evidence == Evidence::ProtocolResponse && candidate.kind == Route::DirectWss && candidate.secure
+                                && scope.epoch == trace::network() && !is_test_dc {
+                                if let Some(target) = direct_target.clone() {
+                                    let pool = pools.ws.clone();
+                                    let host = candidate.host.clone();
+                                    tokio::spawn(async move {
+                                        if scope.epoch == trace::network() {
+                                            let slot = DcSlot { dc, is_media: is_media_int(is_media) };
+                                            pool.clear_refill_failure(scope.epoch, slot).await;
+                                            pool.schedule_refill(slot, target, vec![host], MAX_POOL_SIZE as usize).await;
+                                        }
+                                    });
+                                }
+                            }
+                        }).await;
+                }
+                Upstream::Tcp(mut remote) => {
+                    if scope.epoch != trace::network() { return; }
+                    let peer = remote.peer_addr().ok();
+                    route_use.observe(Evidence::Reachable, peer);
+                    if !matches!(tokio::time::timeout(WS_WRITE_TIMEOUT, remote.write_all(&relay_init)).await, Ok(Ok(()))) {
+                        route_use.observe(Evidence::PeerFailure, peer);
+                        trace::event("relay_init_failed", format_args!("reason=write"));
+                        return;
+                    }
+                    STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
+                    trace::event("relay_init_sent", format_args!("route=Tcp dc={dc} media={is_media}"));
+                    trace::event("route_pinned", format_args!("kind=Tcp dc={dc} media={is_media} test={is_test_dc}"));
+                    bridge_tcp_observed(conn_read, conn_write, remote, clt_decryptor, clt_encryptor,
+                        tg_encryptor, tg_decryptor, cancel_token, Some(FIRST_RESPONSE_TIMEOUT), |evidence| route_use.observe(evidence, peer)).await;
+                }
+            }
             return;
         }
-        let upstream = match acquired {
-            Ok(upstream) => upstream,
-            Err(WsError::NetworkChanged) => return,
-            Err(WsError::Busy | WsError::Canceled) => continue,
-            Err(error) => {
-                if candidate.kind == Route::CfWss {
-                    cf_attempts += 1;
-                }
-                STATS.ws_errors.fetch_add(i64::from(candidate.kind != Route::Tcp), Ordering::Relaxed);
-                trace::event("candidate_failed", format_args!("kind={:?} host={} error={} class={}",
-                    candidate.kind, trace::allowlisted_host(&candidate.host), error.compact(),
-                    connect_failure_class(&error).as_str()));
-                route_use.observe_connect_failure(connect_failure_class(&error));
-                continue;
+        if pass == 0 && !busy_indices.is_empty() {
+            pass = 1;
+            tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                _ = trace::network_changed(scope.epoch) => return,
+                _ = tokio::time::sleep(Duration::from_millis(150)) => {}
             }
-        };
-
-        // After the first write is attempted the init may already be partially on
-        // the wire. All exits below close this client and never use another route.
-        match upstream {
-            Upstream::WebSocket(ws) => {
-                if ws.network != scope.epoch || scope.epoch != trace::network() {
-                    return;
-                }
-                let peer = ws.peer;
-                route_use.observe(if ws.secure { Evidence::TransportVerified } else { Evidence::Reachable }, peer);
-                if ws.send(&relay_init).await.is_err() {
-                    route_use.observe(Evidence::PeerFailure, peer);
-                    trace::event("relay_init_failed", format_args!("reason=write"));
-                    return;
-                }
-                trace::mark_verified();
-                trace::event("relay_init_sent", format_args!("route={:?} dc={dc} media={is_media}", candidate.kind));
-                trace::event("route_pinned", format_args!("kind={:?} host={} dc={dc} media={is_media} test={is_test_dc}",
-                    candidate.kind, trace::allowlisted_host(&candidate.host)));
-                let splitter = if candidate.kind == Route::WorkerWss { None } else { MsgSplitter::new(&relay_init, proto_int) };
-                if candidate.kind == Route::DirectWss {
-                    STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
-                }
-                let probe_timeout = Some(FIRST_RESPONSE_TIMEOUT);
-                bridge_ws(conn_read, conn_write, ws, label, dc, is_media, splitter,
-                    clt_decryptor, clt_encryptor, tg_encryptor, tg_decryptor, cancel_token, probe_timeout,
-                    |evidence| {
-                        route_use.observe(evidence, peer);
-                        if evidence == Evidence::ProtocolResponse && candidate.kind == Route::DirectWss && candidate.secure
-                            && scope.epoch == trace::network() && !is_test_dc {
-                            if let Some(target) = direct_target.clone() {
-                                let pool = pools.ws.clone();
-                                let host = candidate.host.clone();
-                                tokio::spawn(async move {
-                                    if scope.epoch == trace::network() {
-                                        let slot = DcSlot { dc, is_media: is_media_int(is_media) };
-                                        pool.clear_refill_failure(scope.epoch, slot).await;
-                                        pool.schedule_refill(slot, target, vec![host], MAX_POOL_SIZE as usize).await;
-                                    }
-                                });
-                            }
-                        }
-                    }).await;
-            }
-            Upstream::Tcp(mut remote) => {
-                if scope.epoch != trace::network() { return; }
-                let peer = remote.peer_addr().ok();
-                route_use.observe(Evidence::Reachable, peer);
-                if !matches!(tokio::time::timeout(WS_WRITE_TIMEOUT, remote.write_all(&relay_init)).await, Ok(Ok(()))) {
-                    route_use.observe(Evidence::PeerFailure, peer);
-                    trace::event("relay_init_failed", format_args!("reason=write"));
-                    return;
-                }
-                STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
-                trace::event("relay_init_sent", format_args!("route=Tcp dc={dc} media={is_media}"));
-                trace::event("route_pinned", format_args!("kind=Tcp dc={dc} media={is_media} test={is_test_dc}"));
-                bridge_tcp_observed(conn_read, conn_write, remote, clt_decryptor, clt_encryptor,
-                    tg_encryptor, tg_decryptor, cancel_token, Some(FIRST_RESPONSE_TIMEOUT), |evidence| route_use.observe(evidence, peer)).await;
-            }
+            continue;
         }
-        return;
+        break;
     }
+
+    let primary_reason = if candidates.is_empty() {
+        "no_candidates"
+    } else if dial_failed > 0 {
+        "dial_failed"
+    } else if family_cooling > 0 {
+        "family_cooling"
+    } else if route_cooling > 0 {
+        "route_cooling"
+    } else if busy_count > 0 {
+        "busy"
+    } else if family_budget > 0 {
+        "family_budget"
+    } else if route_probing > 0 {
+        "route_probing"
+    } else {
+        "skipped"
+    };
+    pools.routes.lock().record_exhausted(
+        scope,
+        primary_reason,
+        candidates.len(),
+        dial_attempts,
+        Instant::now(),
+    );
     // An immediate EOF while all routes are on cooldown makes Telegram reconnect in a tight loop.
     tokio::select! {
         _ = cancel_token.cancelled() => return,
@@ -1516,7 +1594,11 @@ async fn serve_core<R, W>(
         _ = tokio::time::sleep_until(failed_session_deadline) => {}
     }
     trace::mark_exhausted();
-    lwarn!("[{}] stage=routes_exhausted dc={} media={} test={}", label, dc, is_media, is_test_dc);
+    lwarn!(
+        "[{}] stage=routes_exhausted dc={} media={} test={} reason={} candidates={} attempts={} route_cooling={} route_probing={} family_cooling={} family_budget={} busy={} dial_failed={}",
+        label, dc, is_media, is_test_dc, primary_reason, candidates.len(), dial_attempts,
+        route_cooling, route_probing, family_cooling, family_budget, busy_count, dial_failed
+    );
 }
 
 // ---------------------------------------------------------------------------
