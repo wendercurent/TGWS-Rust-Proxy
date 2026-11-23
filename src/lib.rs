@@ -231,6 +231,12 @@ pub extern "C" fn NotifyDefaultNetworkWithIdentity(kind: c_int, identity: i64) {
 pub extern "C" fn NotifyDefaultNetworkState(kind: c_int, identity: i64, replaced: c_int) {
     let epoch = trace::change_network(kind.clamp(0, 4) as u8, identity as u64, replaced != 0);
     cfproxy::prune_cfproxy_429_cooldowns(epoch);
+    let pools = state_cell().lock().as_ref().map(|state| state.pools.clone());
+    if let Some(pools) = pools {
+        runtime().spawn(async move {
+            pools.ws.evict_stale_epoch(epoch).await;
+        });
+    }
 }
 
 #[unsafe(no_mangle)]

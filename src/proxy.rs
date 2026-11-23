@@ -170,33 +170,82 @@ impl WsPool {
         is_media: bool,
         preferred: Option<&str>,
     ) -> Option<RawWebSocket> {
+        const MAX_CHECKOUT_PROBES: usize = 3;
+        const CHECKOUT_BUDGET: Duration = Duration::from_millis(1200);
+
         let slot = DcSlot {
             dc,
             is_media: is_media_int(is_media),
         };
         let state = self.get_slot(slot).await;
-        let now = now_monotonic();
+        let started = std::time::Instant::now();
+        let epoch = trace::network();
+        let mut stale_skipped = 0usize;
 
-        let candidate = {
-            let mut q = state.queue.lock().await;
-            q.retain(|entry| now - entry.created < WS_POOL_REUSE_MAX_AGE && !entry.ws.is_closed() && entry.ws.network == trace::network());
-            let index = q.iter().position(|entry| preferred.is_none_or(|host| entry.ws.peer_domain == host));
-            index.and_then(|index| q.remove(index)).map(|entry| entry.ws)
-        };
+        for _ in 0..MAX_CHECKOUT_PROBES {
+            if started.elapsed() >= CHECKOUT_BUDGET || trace::network() != epoch {
+                break;
+            }
+            let now = now_monotonic();
+            let candidate = {
+                let mut q = state.queue.lock().await;
+                q.retain(|entry| {
+                    now - entry.created < WS_POOL_REUSE_MAX_AGE
+                        && !entry.ws.is_closed()
+                        && entry.ws.network == epoch
+                });
+                let index = q
+                    .iter()
+                    .position(|entry| preferred.is_none_or(|host| entry.ws.peer_domain == host));
+                index.and_then(|index| q.remove(index)).map(|entry| entry.ws)
+            };
 
-        if let Some(ws) = candidate {
-            let started = std::time::Instant::now();
+            let Some(ws) = candidate else {
+                break;
+            };
             if ws.check_idle().await && ws.network == trace::network() {
-                trace::event("pool_checkout", format_args!("result=hit wait_ms={}", started.elapsed().as_millis()));
+                trace::event(
+                    "pool_checkout",
+                    format_args!(
+                        "result=hit wait_ms={} skipped_stale={stale_skipped}",
+                        started.elapsed().as_millis()
+                    ),
+                );
                 STATS.pool_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(ws);
             }
-            trace::event("pool_checkout", format_args!("result=stale wait_ms={}", started.elapsed().as_millis()));
+            stale_skipped += 1;
+            drop(ws);
+        }
+
+        if stale_skipped > 0 {
+            trace::event(
+                "pool_checkout",
+                format_args!(
+                    "result=stale wait_ms={} skipped_stale={stale_skipped}",
+                    started.elapsed().as_millis()
+                ),
+            );
         } else {
             trace::event("pool_checkout", format_args!("result=miss"));
         }
         STATS.pool_misses.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    pub async fn evict_stale_epoch(&self, epoch: u64) {
+        let slots: Vec<Arc<SlotState>> = {
+            let map = self.slots.lock().await;
+            map.values().cloned().collect()
+        };
+        for state in slots {
+            let mut q = state.queue.lock().await;
+            q.retain(|entry| entry.ws.network == epoch && !entry.ws.is_closed());
+        }
+        self.refill_failures
+            .lock()
+            .await
+            .retain(|(seen, _), _| *seen == epoch);
     }
 
     async fn schedule_refill(
@@ -2429,6 +2478,63 @@ mod route_policy_tests {
             !events.contains(&Evidence::ProtocolResponse) && !events.contains(&Evidence::PeerFailure),
             "client write failure must not emit ProtocolResponse or PeerFailure: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ws_pool_get_skips_stale_socket_and_returns_healthy_second_socket() {
+        let pool = Arc::new(WsPool::new(CancellationToken::new()));
+        let (stale_ws, stale_peer) = crate::ws::tests::loopback_ws().await;
+        drop(stale_peer); // peer closed -> check_idle fails immediately
+
+        let (healthy_ws, mut healthy_peer) = crate::ws::tests::loopback_ws().await;
+        let pong_task = tokio::spawn(async move {
+            // Read client-masked 8-byte PING frame: 2 header bytes + 4 mask bytes + 8 payload bytes = 14 bytes
+            let mut frame = [0u8; 14];
+            healthy_peer.read_exact(&mut frame).await.unwrap();
+            let mask = &frame[2..6];
+            let mut nonce = [0u8; 8];
+            for i in 0..8 {
+                nonce[i] = frame[6 + i] ^ mask[i % 4];
+            }
+            healthy_peer
+                .write_all(&build_frame(OP_PONG, &nonce, false))
+                .await
+                .unwrap();
+        });
+
+        let slot = DcSlot { dc: 2, is_media: 1 };
+        let state = pool.get_slot(slot).await;
+        {
+            let mut q = state.queue.lock().await;
+            q.push_back(PoolEntry { ws: stale_ws, created: now_monotonic() });
+            q.push_back(PoolEntry { ws: healthy_ws, created: now_monotonic() });
+        }
+
+        let got = pool.get(2, true, Some("loopback")).await;
+        assert!(got.is_some(), "pool checkout must skip stale socket and return live second entry");
+        pong_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_pool_evict_stale_epoch_removes_old_network_entries_and_keeps_current() {
+        let pool = Arc::new(WsPool::new(CancellationToken::new()));
+        let (mut old_ws, _old_peer) = crate::ws::tests::loopback_ws().await;
+        let current_epoch = trace::network();
+        old_ws.network = current_epoch.wrapping_add(8);
+        let (cur_ws, _cur_peer) = crate::ws::tests::loopback_ws().await;
+
+        let slot = DcSlot { dc: 4, is_media: 1 };
+        let state = pool.get_slot(slot).await;
+        {
+            let mut q = state.queue.lock().await;
+            q.push_back(PoolEntry { ws: old_ws, created: now_monotonic() });
+            q.push_back(PoolEntry { ws: cur_ws, created: now_monotonic() });
+        }
+
+        pool.evict_stale_epoch(current_epoch).await;
+        let q = state.queue.lock().await;
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].ws.network, current_epoch);
     }
 
     #[test]
