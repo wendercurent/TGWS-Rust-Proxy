@@ -552,6 +552,7 @@ where
     let mut conn_write = conn_write;
     let mut up_bytes = 0;
     let sent_payload = AtomicBool::new(false);
+    let (sent_tx, mut sent_rx) = tokio::sync::watch::channel(false);
     let mut down_bytes = 0;
     let mut upstream_read = 0;
     let mut replies = trace::ReplyObserver::for_session();
@@ -559,8 +560,6 @@ where
     let mut sustained = false;
     let mut has_response = false;
     let mut framed = false;
-    let probe_deadline = tokio::time::sleep(probe_timeout.unwrap_or_default());
-    tokio::pin!(probe_deadline);
     let mut transport_error = false;
     let close_reason = {
         let up = async {
@@ -594,7 +593,8 @@ where
                     continue;
                 }
                 if up_bytes == 0 {
-                    sent_payload.store(true, Ordering::Relaxed);
+                    sent_payload.store(true, Ordering::Release);
+                    let _ = sent_tx.send(true);
                     ldebug!("[{}] stage=first_upstream_payload elapsed_ms={}", label, started.elapsed().as_millis());
                 }
                 up_bytes += sent;
@@ -603,10 +603,21 @@ where
             }
         };
         let down = async {
+            let first_response_wait = async {
+                let Some(timeout) = probe_timeout else {
+                    std::future::pending::<()>().await;
+                    return;
+                };
+                if !*sent_rx.borrow() {
+                    let _ = sent_rx.wait_for(|sent| *sent).await;
+                }
+                tokio::time::sleep(timeout).await;
+            };
+            tokio::pin!(first_response_wait);
             loop {
                 let incoming = tokio::select! {
-                    _ = &mut probe_deadline, if probe_timeout.is_some() && !has_response => {
-                        return "probe_timeout";
+                    _ = &mut first_response_wait, if probe_timeout.is_some() && !has_response && !transport_error => {
+                        return "first_response_timeout";
                     }
                     incoming = ws.recv() => incoming,
                 };
@@ -707,7 +718,7 @@ where
     }
     trace::event("relay_end", format_args!("reason={close_reason} read_bytes={upstream_read} up_bytes={up_bytes} down_bytes={down_bytes}"));
     if !has_response && !transport_error && up_bytes > 0 {
-        if close_reason == "probe_timeout" {
+        if matches!(close_reason, "probe_timeout" | "first_response_timeout" | "idle_timeout") {
             observe(Evidence::ResponseTimeout);
         } else if close_reason.starts_with("upstream_") {
             observe(Evidence::PeerFailure);
@@ -738,102 +749,202 @@ pub async fn bridge_tcp<CR, CW>(
     CR: AsyncReadExt + Unpin + Send + 'static,
     CW: AsyncWriteExt + Unpin + Send + 'static,
 {
-    bridge_tcp_observed(c_read, c_write, remote, clt_dec, clt_enc, tg_enc, tg_dec,
-        cancel_token, |_| {}).await;
+    bridge_tcp_observed(
+        c_read,
+        c_write,
+        remote,
+        clt_dec,
+        clt_enc,
+        tg_enc,
+        tg_dec,
+        cancel_token,
+        Some(FIRST_RESPONSE_TIMEOUT),
+        |_| {},
+    )
+    .await;
+}
+
+enum TcpClose {
+    UpstreamEof,
+    UpstreamRead,
+    UpstreamWrite,
+    UpstreamTimeout,
+    ClientRead,
+    ClientIdleTimeout,
+    ClientWrite,
+    ClientBackpressure,
+    FirstResponseTimeout,
+}
+
+impl TcpClose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamEof => "upstream_eof",
+            Self::UpstreamRead => "upstream_read",
+            Self::UpstreamWrite => "upstream_write",
+            Self::UpstreamTimeout => "upstream_timeout",
+            Self::ClientRead => "client_read",
+            Self::ClientIdleTimeout => "client_idle_timeout",
+            Self::ClientWrite => "client_write",
+            Self::ClientBackpressure => "client_backpressure",
+            Self::FirstResponseTimeout => "first_response_timeout",
+        }
+    }
 }
 
 async fn bridge_tcp_observed<CR, CW>(
     mut c_read: CR,
     mut c_write: CW,
     mut remote: TcpStream,
-    clt_dec: TrackedStream,
-    clt_enc: TrackedStream,
-    tg_enc: TrackedStream,
-    tg_dec: TrackedStream,
+    mut clt_dec: TrackedStream,
+    mut clt_enc: TrackedStream,
+    mut tg_enc: TrackedStream,
+    mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
+    first_response_timeout: Option<Duration>,
     mut observe: impl FnMut(Evidence),
 ) where
     CR: AsyncReadExt + Unpin + Send + 'static,
     CW: AsyncWriteExt + Unpin + Send + 'static,
 {
     let (mut r_read, mut r_write) = remote.split();
-    let up = relay_tcp_direction(&mut c_read, &mut r_write, clt_dec, tg_enc, &STATS.bytes_up, |_| {});
+    let up_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let (sent_tx, mut sent_rx) = tokio::sync::watch::channel(false);
+    let up = async {
+        let mut buffer = vec![0; WS_BRIDGE_CHUNK_SIZE];
+        loop {
+            let n = match tokio::time::timeout(BRIDGE_READ_TIMEOUT, c_read.read(&mut buffer)).await {
+                Ok(Ok(0)) => {
+                    let _ = tokio::time::timeout(WS_WRITE_TIMEOUT, r_write.shutdown()).await;
+                    return Ok::<(), TcpClose>(());
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => return Err(TcpClose::ClientRead),
+                Err(_) => return Err(TcpClose::ClientIdleTimeout),
+            };
+            let chunk = &mut buffer[..n];
+            clt_dec.xor(chunk);
+            tg_enc.xor(chunk);
+            match tokio::time::timeout(WS_WRITE_TIMEOUT, r_write.write_all(chunk)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(TcpClose::UpstreamWrite),
+                Err(_) => return Err(TcpClose::UpstreamTimeout),
+            }
+            if up_bytes.fetch_add(n, Ordering::Relaxed) == 0 {
+                let _ = sent_tx.send(true);
+            }
+            STATS.bytes_up.fetch_add(n as i64, Ordering::Relaxed);
+        }
+    };
+
     let mut reply = trace::ReplyObserver::for_session();
-    let mut delivered = 0;
+    let mut delivered = 0usize;
     let mut framed = false;
     let mut reported_response = false;
     let mut reported_sustained = false;
     let mut transport_error = false;
-    let down = relay_tcp_direction(&mut r_read, &mut c_write, tg_dec, clt_enc, &STATS.bytes_down, |plain| {
-        STATS.bytes_upstream_received.fetch_add(plain.len() as i64, Ordering::Relaxed);
-        reply.observe(plain, |class| {
-            match class {
+    let down = async {
+        let first_response_wait = async {
+            let Some(timeout) = first_response_timeout else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            if !*sent_rx.borrow() {
+                let _ = sent_rx.wait_for(|sent| *sent).await;
+            }
+            tokio::time::sleep(timeout).await;
+        };
+        tokio::pin!(first_response_wait);
+        let mut buffer = vec![0; WS_BRIDGE_CHUNK_SIZE];
+        loop {
+            let read_res = tokio::select! {
+                _ = &mut first_response_wait, if first_response_timeout.is_some() && !reported_response && !transport_error => {
+                    return Err::<(), TcpClose>(TcpClose::FirstResponseTimeout);
+                }
+                res = tokio::time::timeout(BRIDGE_READ_TIMEOUT, r_read.read(&mut buffer)) => res,
+            };
+            let n = match read_res {
+                Ok(Ok(0)) => {
+                    let _ = tokio::time::timeout(WS_WRITE_TIMEOUT, c_write.shutdown()).await;
+                    return Err(TcpClose::UpstreamEof);
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(error)) => {
+                    trace::event("tcp_relay_error", format_args!("side=upstream kind={} errno={:?}", error.kind(), error.raw_os_error()));
+                    return Err(TcpClose::UpstreamRead);
+                }
+                Err(_) => return Err(TcpClose::UpstreamTimeout),
+            };
+            let chunk = &mut buffer[..n];
+            tg_dec.xor(chunk);
+            STATS.bytes_upstream_received.fetch_add(n as i64, Ordering::Relaxed);
+            let mut new_transport_error = None;
+            reply.observe(chunk, |class| match class {
                 trace::ReplyClass::TransportError(code) if !transport_error => {
                     transport_error = true;
                     trace::event("transport_error", format_args!("code={code} after_payload={framed}"));
                     if !framed {
-                        observe(Evidence::TransportError(code));
+                        new_transport_error = Some(code);
                     }
                 }
                 trace::ReplyClass::FramedPayload => framed = true,
-                trace::ReplyClass::InvalidEnvelope => trace::event("transport_envelope_invalid", format_args!("direction=downstream")),
+                trace::ReplyClass::InvalidEnvelope => {
+                    trace::event("transport_envelope_invalid", format_args!("direction=downstream"));
+                }
                 _ => {}
+            });
+            if let Some(code) = new_transport_error {
+                observe(Evidence::TransportError(code));
             }
-        });
-        let next = delivered + plain.len();
-        if framed && !transport_error && !reported_response && next >= 32 {
-            reported_response = true;
-            observe(Evidence::ProtocolResponse);
-            trace::mark_relay();
+            clt_enc.xor(chunk);
+            match tokio::time::timeout(WS_WRITE_TIMEOUT, c_write.write_all(chunk)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    trace::event("tcp_relay_error", format_args!("side=client kind={} errno={:?}", error.kind(), error.raw_os_error()));
+                    return Err(TcpClose::ClientWrite);
+                }
+                Err(_) => return Err(TcpClose::ClientBackpressure),
+            }
+            STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
+            delivered += n;
+            let sent = up_bytes.load(Ordering::Relaxed) > 0;
+            if sent && framed && !transport_error && !reported_response && delivered >= 32 {
+                reported_response = true;
+                observe(Evidence::ProtocolResponse);
+                trace::mark_relay();
+            }
+            if sent && framed && !transport_error && !reported_sustained && delivered >= 32 * 1024 {
+                reported_sustained = true;
+                observe(Evidence::Sustained);
+                trace::mark_relay();
+            }
         }
-        if framed && !transport_error && !reported_sustained && next >= 32 * 1024 {
-            reported_sustained = true;
-            observe(Evidence::Sustained);
-            trace::mark_relay();
-        }
-        delivered = next;
-    });
+    };
+
     let ended = tokio::select! {
         _ = cancel_token.cancelled() => "service_stop",
         result = async { tokio::try_join!(up, down) } => match result {
             Ok(_) => "eof",
-            Err(error) => {
-                trace::event("tcp_relay_error", format_args!("kind={} errno={:?}", error.kind(), error.raw_os_error()));
-                "io_error"
-            }
-        }
+            Err(close) => close.as_str(),
+        },
     };
+    if !reported_response && !transport_error && up_bytes.load(Ordering::Relaxed) > 0 {
+        match ended {
+            "first_response_timeout" | "upstream_timeout" => observe(Evidence::ResponseTimeout),
+            "upstream_eof" | "upstream_read" | "upstream_write" => observe(Evidence::PeerFailure),
+            _ => {}
+        }
+    }
     if reply.incomplete() {
         trace::event("transport_record_incomplete", format_args!("direction=downstream"));
     }
-    trace::event("relay_end", format_args!("transport=tcp reason={ended} down_bytes={delivered}"));
-}
-
-async fn relay_tcp_direction<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    mut decrypt: TrackedStream,
-    mut encrypt: TrackedStream,
-    bytes: &std::sync::atomic::AtomicI64,
-    mut observe: impl FnMut(&[u8]),
-) -> std::io::Result<()>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let mut buffer = vec![0; WS_BRIDGE_CHUNK_SIZE];
-    loop {
-        let n = tokio::time::timeout(BRIDGE_READ_TIMEOUT, reader.read(&mut buffer)).await??;
-        if n == 0 {
-            return tokio::time::timeout(WS_WRITE_TIMEOUT, writer.shutdown()).await?;
-        }
-        let chunk = &mut buffer[..n];
-        decrypt.xor(chunk);
-        observe(chunk);
-        encrypt.xor(chunk);
-        tokio::time::timeout(WS_WRITE_TIMEOUT, writer.write_all(chunk)).await??;
-        bytes.fetch_add(n as i64, Ordering::Relaxed);
-    }
+    trace::event(
+        "relay_end",
+        format_args!(
+            "transport=tcp reason={ended} up_bytes={} down_bytes={delivered}",
+            up_bytes.load(Ordering::Relaxed)
+        ),
+    );
 }
 
 pub async fn bridge_tcp_stream(
@@ -1359,7 +1470,7 @@ async fn serve_core<R, W>(
                 } else {
                     STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
                 }
-                let probe_timeout = route_use.is_family_probe().then_some(Duration::from_secs(10));
+                let probe_timeout = Some(FIRST_RESPONSE_TIMEOUT);
                 bridge_ws(conn_read, conn_write, ws, label, dc, is_media, splitter,
                     clt_decryptor, clt_encryptor, tg_encryptor, tg_decryptor, cancel_token, probe_timeout,
                     |evidence| {
@@ -1393,7 +1504,7 @@ async fn serve_core<R, W>(
                 trace::event("relay_init_sent", format_args!("route=Tcp dc={dc} media={is_media}"));
                 trace::event("route_pinned", format_args!("kind=Tcp dc={dc} media={is_media} test={is_test_dc}"));
                 bridge_tcp_observed(conn_read, conn_write, remote, clt_decryptor, clt_encryptor,
-                    tg_encryptor, tg_decryptor, cancel_token, |evidence| route_use.observe(evidence, peer)).await;
+                    tg_encryptor, tg_decryptor, cancel_token, Some(FIRST_RESPONSE_TIMEOUT), |evidence| route_use.observe(evidence, peer)).await;
             }
         }
         return;
@@ -2104,6 +2215,138 @@ mod route_policy_tests {
             Some(Duration::from_millis(100)), |evidence| events.push(evidence)).await;
         assert!(!result);
         assert_eq!(events, [Evidence::ResponseTimeout]);
+    }
+
+    #[tokio::test]
+    async fn ws_idle_without_client_request_does_not_trigger_first_response_timeout() {
+        let (ws, _peer) = crate::ws::tests::loopback_ws().await;
+        let (_client, proxy) = tokio::io::duplex(32);
+        let (read, write) = tokio::io::split(proxy);
+        let cipher = || new_aes_ctr(&[0; 32], &[0; 16]);
+        let cancel = CancellationToken::new();
+        let cancel_soon = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            cancel_soon.cancel();
+        });
+        let mut events = Vec::new();
+        let result = bridge_ws(
+            read, write, ws, "idle".into(), 2, false, None,
+            cipher(), cipher(), cipher(), cipher(), cancel,
+            Some(Duration::from_millis(60)),
+            |evidence| events.push(evidence),
+        )
+        .await;
+        assert!(!result);
+        assert!(events.is_empty(), "idle socket without client request must not record timeout: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn tcp_silent_upstream_after_request_records_response_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 32];
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let remote = TcpStream::connect(addr).await.unwrap();
+        let (mut client, proxy) = tokio::io::duplex(64);
+        client.write_all(b"client-request").await.unwrap();
+        let (read, write) = tokio::io::split(proxy);
+        let cipher = || new_aes_ctr(&[0; 32], &[0; 16]);
+        let mut events = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            bridge_tcp_observed(
+                read, write, remote,
+                cipher(), cipher(), cipher(), cipher(),
+                CancellationToken::new(),
+                Some(Duration::from_millis(100)),
+                |evidence| events.push(evidence),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events, [Evidence::ResponseTimeout]);
+    }
+
+    #[tokio::test]
+    async fn tcp_early_upstream_eof_after_request_records_peer_failure() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 32];
+            let _ = socket.read(&mut buf).await;
+            drop(socket);
+        });
+        let remote = TcpStream::connect(addr).await.unwrap();
+        let (mut client, proxy) = tokio::io::duplex(64);
+        client.write_all(b"client-request").await.unwrap();
+        let (read, write) = tokio::io::split(proxy);
+        let cipher = || new_aes_ctr(&[0; 32], &[0; 16]);
+        let mut events = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            bridge_tcp_observed(
+                read, write, remote,
+                cipher(), cipher(), cipher(), cipher(),
+                CancellationToken::new(),
+                Some(Duration::from_secs(5)),
+                |evidence| events.push(evidence),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events, [Evidence::PeerFailure]);
+    }
+
+    #[tokio::test]
+    async fn tcp_client_write_failure_does_not_record_protocol_response_or_upstream_failure() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 32];
+            let _ = socket.read(&mut buf).await;
+            // Send a valid intermediate-framed 36-byte payload (len=32 + 32 bytes)
+            let mut frame = Vec::with_capacity(36);
+            frame.extend_from_slice(&32u32.to_le_bytes());
+            frame.extend_from_slice(&[0xAB; 32]);
+            let _ = socket.write_all(&frame).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let remote = TcpStream::connect(addr).await.unwrap();
+        let (mut client, proxy) = tokio::io::duplex(64);
+        client.write_all(b"client-request").await.unwrap();
+        drop(client); // Client disconnects before receiving response
+        let (read, write) = tokio::io::split(proxy);
+        let cipher = || new_aes_ctr(&[0; 32], &[0; 16]);
+        let mut events = Vec::new();
+        let session = trace::Session::new(1, 1);
+        trace::SESSION
+            .scope(session, async {
+                trace::set_protocol(PROTO_INTERMEDIATE_INT);
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    bridge_tcp_observed(
+                        read, write, remote,
+                        cipher(), cipher(), cipher(), cipher(),
+                        CancellationToken::new(),
+                        Some(Duration::from_secs(2)),
+                        |evidence| events.push(evidence),
+                    ),
+                )
+                .await
+                .unwrap();
+            })
+            .await;
+        assert!(
+            !events.contains(&Evidence::ProtocolResponse) && !events.contains(&Evidence::PeerFailure),
+            "client write failure must not emit ProtocolResponse or PeerFailure: {events:?}"
+        );
     }
 
     #[test]

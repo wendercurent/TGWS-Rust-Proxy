@@ -864,10 +864,6 @@ impl<'a> RouteUse<'a> {
         })
     }
 
-    pub(crate) fn is_family_probe(&self) -> bool {
-        self.family == Some(FamilyAttempt::Probe)
-    }
-
     pub(crate) fn observe_connect_failure(&mut self, class: FailureClass) {
         self.observe_at(Evidence::DialFailure, None, class, Instant::now());
     }
