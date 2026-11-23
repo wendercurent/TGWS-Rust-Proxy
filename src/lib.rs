@@ -100,6 +100,29 @@ mod lifecycle_tests {
             }
         }
     }
+
+    #[test]
+    fn start_proxy_rejects_invalid_secret_without_binding_or_overwriting() {
+        let addr = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap();
+        let host = CString::new("127.0.0.1").unwrap();
+        let previous = PROXY_SECRET.read().clone();
+        *PROXY_SECRET.write() = "11111111111111111111111111111111".to_string();
+
+        for bad in ["", "short", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "4242424242424242424242424242424200"] {
+            let secret = CString::new(bad).unwrap();
+            let result = unsafe {
+                StartProxy(host.as_ptr(), i32::from(addr.port()), std::ptr::null(), secret.as_ptr(), 0)
+            };
+            assert_eq!(result, -5, "expected invalid secret rejection for len={}", bad.len());
+            assert_eq!(*PROXY_SECRET.read(), "11111111111111111111111111111111");
+            assert!(
+                TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err(),
+                "listener must not bind when secret is invalid"
+            );
+        }
+
+        *PROXY_SECRET.write() = previous;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,14 +152,15 @@ pub unsafe extern "C" fn StartProxy(
     let secret_str = cstr_to_string(c_secret);
     let is_verbose = verbose != 0;
 
+    let valid_secret = secret_str.len() == 32 && hex::decode(&secret_str).is_ok();
+    if !valid_secret {
+        return -5;
+    }
+
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
 
-    if secret_str.len() == 32 {
-        if hex::decode(&secret_str).is_ok() {
-            *PROXY_SECRET.write() = secret_str.clone();
-        }
-    }
+    *PROXY_SECRET.write() = secret_str;
 
     cfproxy::init_cfproxy_domains();
 
