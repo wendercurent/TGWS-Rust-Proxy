@@ -8,7 +8,7 @@
   <img src="docs/screenshots/dev-info.png" alt="Сведения о версии и сбор отчёта" width="250">
 </p>
 
-[Скачать v1.0.0](https://github.com/wendercurent/TGWS-Rust-Proxy/releases/tag/v1.0.0) · [Сообщить о проблеме](https://github.com/wendercurent/TGWS-Rust-Proxy/issues)
+[Скачать v1.1.0](https://github.com/wendercurent/TGWS-Rust-Proxy/releases/tag/v1.1.0) · [Сообщить о проблеме](https://github.com/wendercurent/TGWS-Rust-Proxy/issues)
 
 ## Что умеет приложение
 
