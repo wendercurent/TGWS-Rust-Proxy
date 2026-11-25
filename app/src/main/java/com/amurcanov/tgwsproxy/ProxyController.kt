@@ -5,8 +5,11 @@ import android.content.Intent
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 object ProxyController {
+    private val secretInitMutex = Mutex()
 
     suspend fun startFromSavedSettings(
         context: Context,
@@ -89,16 +92,17 @@ object ProxyController {
         ProxyTileService.requestSync(context)
     }
 
-    private suspend fun ensureSecretKey(settingsStore: SettingsStore): String {
-        val current = settingsStore.secretKey.first().trim()
-        if (isValidSecret(current)) {
-            return current
-        }
+    private suspend fun ensureSecretKey(settingsStore: SettingsStore): String =
+        secretInitMutex.withLock {
+            val current = settingsStore.secretKey.first().trim()
+            if (isValidSecret(current)) {
+                return@withLock current
+            }
 
-        val generated = generateRandomSecret()
-        settingsStore.saveSecretKey(generated)
-        return generated
-    }
+            val generated = generateRandomSecret()
+            settingsStore.saveSecretKey(generated)
+            generated
+        }
 
     private fun MutableList<String>.appendDc(dc: Int, value: String) {
         val ip = value.trim()
@@ -113,7 +117,7 @@ object ProxyController {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
-    private fun isValidSecret(value: String): Boolean {
+    internal fun isValidSecret(value: String): Boolean {
         return value.length == 32 && value.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
     }
 }

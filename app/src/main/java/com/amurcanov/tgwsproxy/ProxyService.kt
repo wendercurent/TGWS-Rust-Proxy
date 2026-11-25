@@ -33,9 +33,7 @@ import java.util.concurrent.Executors
 class ProxyService : Service() {
 
     private val connectivity by lazy { getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager }
-    private var defaultNetwork: Network? = null
-    private var defaultTransport = -1
-    private var defaultLinks: Pair<List<String>, List<String>>? = null
+    private var lastNetworkSnapshot: NetworkSnapshot? = null
     private var observesDefaultNetwork = false
     private val networkHandler = Handler(Looper.getMainLooper())
     private val networkSnapshot = Runnable { reportDefaultNetwork() }
@@ -170,7 +168,6 @@ class ProxyService : Service() {
     private fun reportDefaultNetwork() {
         if (destroyed || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
         val active = connectivity.activeNetwork
-        _networkAvailable.value = active != null
         val capabilities = connectivity.getNetworkCapabilities(active)
         val transport = when {
             active == null -> 0
@@ -179,19 +176,28 @@ class ProxyService : Service() {
             capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> 2
             else -> 3
         }
+        val validated = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        val hasInternet = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
         val links = connectivity.getLinkProperties(active)?.let {
             it.linkAddresses.map { address -> address.toString() }.sorted() to
                 it.dnsServers.map { address -> address.hostAddress.orEmpty() }
         }
-        if (active == defaultNetwork && transport == defaultTransport && links == defaultLinks) return
-        val replaced = active != defaultNetwork
-        defaultNetwork = active
-        defaultTransport = transport
-        defaultLinks = links
-        val identity = if (active != null && bootCount >= 0 && transport in 1..2) {
-            active.networkHandle xor (bootCount.toLong() shl 17)
-        } else 0L
-        NativeProxy.notifyDefaultNetwork(transport, identity, replaced)
+        val snapshot = NetworkSnapshot(
+            networkHandle = active?.networkHandle,
+            transport = transport,
+            validated = validated,
+            hasInternet = hasInternet,
+            links = links,
+        )
+        _networkAvailable.value = NetworkSnapshotPolicy.isNetworkAvailable(snapshot)
+        val transition = NetworkSnapshotPolicy.evaluate(lastNetworkSnapshot, snapshot)
+        lastNetworkSnapshot = snapshot
+        if (transition is NetworkTransition.Notify) {
+            val identity = if (active != null && bootCount >= 0 && transition.transport in 1..2) {
+                active.networkHandle xor (bootCount.toLong() shl 17)
+            } else 0L
+            NativeProxy.notifyDefaultNetwork(transition.transport, identity, transition.replaced)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -481,18 +487,25 @@ class ProxyService : Service() {
         statsJob?.cancel()
         statsJob = null
         serviceScope.launch(Dispatchers.Main.immediate) {
-            updateNotification(getString(R.string.notification_stopping), force = true)
-            requestNativeStop("stop")
-            releaseWakeLock()
-            updateRunningState(false)
-            inForeground = false
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
+            try {
+                updateNotification(getString(R.string.notification_stopping), force = true)
+                val stopped = requestNativeStop("stop")
+                if (!stopped) {
+                    Log.w(TAG, "Proceeding with service teardown while native stop finishes in background")
+                }
+                releaseWakeLock()
+                updateRunningState(false)
+                inForeground = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
+                stopSelf()
+            } finally {
+                stopInProgress = false
             }
-            stopSelf()
         }
     }
 

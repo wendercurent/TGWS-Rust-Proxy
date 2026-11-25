@@ -1,5 +1,5 @@
 use crate::trace::{self, Route};
-use crate::routing::{Candidate, Evidence, FailureClass, Manager, RouteUse, Scope};
+use crate::routing::{Candidate, Evidence, FailureClass, Manager, RouteUse, Scope, SkipReason};
 use crate::cfproxy::*;
 use crate::config::*;
 use crate::crypto::*;
@@ -170,33 +170,82 @@ impl WsPool {
         is_media: bool,
         preferred: Option<&str>,
     ) -> Option<RawWebSocket> {
+        const MAX_CHECKOUT_PROBES: usize = 3;
+        const CHECKOUT_BUDGET: Duration = Duration::from_millis(1200);
+
         let slot = DcSlot {
             dc,
             is_media: is_media_int(is_media),
         };
         let state = self.get_slot(slot).await;
-        let now = now_monotonic();
+        let started = std::time::Instant::now();
+        let epoch = trace::network();
+        let mut stale_skipped = 0usize;
 
-        let candidate = {
-            let mut q = state.queue.lock().await;
-            q.retain(|entry| now - entry.created < WS_POOL_REUSE_MAX_AGE && !entry.ws.is_closed() && entry.ws.network == trace::network());
-            let index = q.iter().position(|entry| preferred.is_none_or(|host| entry.ws.peer_domain == host));
-            index.and_then(|index| q.remove(index)).map(|entry| entry.ws)
-        };
+        for _ in 0..MAX_CHECKOUT_PROBES {
+            if started.elapsed() >= CHECKOUT_BUDGET || trace::network() != epoch {
+                break;
+            }
+            let now = now_monotonic();
+            let candidate = {
+                let mut q = state.queue.lock().await;
+                q.retain(|entry| {
+                    now - entry.created < WS_POOL_REUSE_MAX_AGE
+                        && !entry.ws.is_closed()
+                        && entry.ws.network == epoch
+                });
+                let index = q
+                    .iter()
+                    .position(|entry| preferred.is_none_or(|host| entry.ws.peer_domain == host));
+                index.and_then(|index| q.remove(index)).map(|entry| entry.ws)
+            };
 
-        if let Some(ws) = candidate {
-            let started = std::time::Instant::now();
+            let Some(ws) = candidate else {
+                break;
+            };
             if ws.check_idle().await && ws.network == trace::network() {
-                trace::event("pool_checkout", format_args!("result=hit wait_ms={}", started.elapsed().as_millis()));
+                trace::event(
+                    "pool_checkout",
+                    format_args!(
+                        "result=hit wait_ms={} skipped_stale={stale_skipped}",
+                        started.elapsed().as_millis()
+                    ),
+                );
                 STATS.pool_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(ws);
             }
-            trace::event("pool_checkout", format_args!("result=stale wait_ms={}", started.elapsed().as_millis()));
+            stale_skipped += 1;
+            drop(ws);
+        }
+
+        if stale_skipped > 0 {
+            trace::event(
+                "pool_checkout",
+                format_args!(
+                    "result=stale wait_ms={} skipped_stale={stale_skipped}",
+                    started.elapsed().as_millis()
+                ),
+            );
         } else {
             trace::event("pool_checkout", format_args!("result=miss"));
         }
         STATS.pool_misses.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    pub async fn evict_stale_epoch(&self, epoch: u64) {
+        let slots: Vec<Arc<SlotState>> = {
+            let map = self.slots.lock().await;
+            map.values().cloned().collect()
+        };
+        for state in slots {
+            let mut q = state.queue.lock().await;
+            q.retain(|entry| entry.ws.network == epoch && !entry.ws.is_closed());
+        }
+        self.refill_failures
+            .lock()
+            .await
+            .retain(|(seen, _), _| *seen == epoch);
     }
 
     async fn schedule_refill(
@@ -552,6 +601,7 @@ where
     let mut conn_write = conn_write;
     let mut up_bytes = 0;
     let sent_payload = AtomicBool::new(false);
+    let (sent_tx, mut sent_rx) = tokio::sync::watch::channel(false);
     let mut down_bytes = 0;
     let mut upstream_read = 0;
     let mut replies = trace::ReplyObserver::for_session();
@@ -559,8 +609,6 @@ where
     let mut sustained = false;
     let mut has_response = false;
     let mut framed = false;
-    let probe_deadline = tokio::time::sleep(probe_timeout.unwrap_or_default());
-    tokio::pin!(probe_deadline);
     let mut transport_error = false;
     let close_reason = {
         let up = async {
@@ -594,7 +642,8 @@ where
                     continue;
                 }
                 if up_bytes == 0 {
-                    sent_payload.store(true, Ordering::Relaxed);
+                    sent_payload.store(true, Ordering::Release);
+                    let _ = sent_tx.send(true);
                     ldebug!("[{}] stage=first_upstream_payload elapsed_ms={}", label, started.elapsed().as_millis());
                 }
                 up_bytes += sent;
@@ -603,10 +652,21 @@ where
             }
         };
         let down = async {
+            let first_response_wait = async {
+                let Some(timeout) = probe_timeout else {
+                    std::future::pending::<()>().await;
+                    return;
+                };
+                if !*sent_rx.borrow() {
+                    let _ = sent_rx.wait_for(|sent| *sent).await;
+                }
+                tokio::time::sleep(timeout).await;
+            };
+            tokio::pin!(first_response_wait);
             loop {
                 let incoming = tokio::select! {
-                    _ = &mut probe_deadline, if probe_timeout.is_some() && !has_response => {
-                        return "probe_timeout";
+                    _ = &mut first_response_wait, if probe_timeout.is_some() && !has_response && !transport_error => {
+                        return "first_response_timeout";
                     }
                     incoming = ws.recv() => incoming,
                 };
@@ -707,7 +767,7 @@ where
     }
     trace::event("relay_end", format_args!("reason={close_reason} read_bytes={upstream_read} up_bytes={up_bytes} down_bytes={down_bytes}"));
     if !has_response && !transport_error && up_bytes > 0 {
-        if close_reason == "probe_timeout" {
+        if matches!(close_reason, "probe_timeout" | "first_response_timeout" | "idle_timeout") {
             observe(Evidence::ResponseTimeout);
         } else if close_reason.starts_with("upstream_") {
             observe(Evidence::PeerFailure);
@@ -738,102 +798,202 @@ pub async fn bridge_tcp<CR, CW>(
     CR: AsyncReadExt + Unpin + Send + 'static,
     CW: AsyncWriteExt + Unpin + Send + 'static,
 {
-    bridge_tcp_observed(c_read, c_write, remote, clt_dec, clt_enc, tg_enc, tg_dec,
-        cancel_token, |_| {}).await;
+    bridge_tcp_observed(
+        c_read,
+        c_write,
+        remote,
+        clt_dec,
+        clt_enc,
+        tg_enc,
+        tg_dec,
+        cancel_token,
+        Some(FIRST_RESPONSE_TIMEOUT),
+        |_| {},
+    )
+    .await;
+}
+
+enum TcpClose {
+    UpstreamEof,
+    UpstreamRead,
+    UpstreamWrite,
+    UpstreamTimeout,
+    ClientRead,
+    ClientIdleTimeout,
+    ClientWrite,
+    ClientBackpressure,
+    FirstResponseTimeout,
+}
+
+impl TcpClose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamEof => "upstream_eof",
+            Self::UpstreamRead => "upstream_read",
+            Self::UpstreamWrite => "upstream_write",
+            Self::UpstreamTimeout => "upstream_timeout",
+            Self::ClientRead => "client_read",
+            Self::ClientIdleTimeout => "client_idle_timeout",
+            Self::ClientWrite => "client_write",
+            Self::ClientBackpressure => "client_backpressure",
+            Self::FirstResponseTimeout => "first_response_timeout",
+        }
+    }
 }
 
 async fn bridge_tcp_observed<CR, CW>(
     mut c_read: CR,
     mut c_write: CW,
     mut remote: TcpStream,
-    clt_dec: TrackedStream,
-    clt_enc: TrackedStream,
-    tg_enc: TrackedStream,
-    tg_dec: TrackedStream,
+    mut clt_dec: TrackedStream,
+    mut clt_enc: TrackedStream,
+    mut tg_enc: TrackedStream,
+    mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
+    first_response_timeout: Option<Duration>,
     mut observe: impl FnMut(Evidence),
 ) where
     CR: AsyncReadExt + Unpin + Send + 'static,
     CW: AsyncWriteExt + Unpin + Send + 'static,
 {
     let (mut r_read, mut r_write) = remote.split();
-    let up = relay_tcp_direction(&mut c_read, &mut r_write, clt_dec, tg_enc, &STATS.bytes_up, |_| {});
+    let up_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let (sent_tx, mut sent_rx) = tokio::sync::watch::channel(false);
+    let up = async {
+        let mut buffer = vec![0; WS_BRIDGE_CHUNK_SIZE];
+        loop {
+            let n = match tokio::time::timeout(BRIDGE_READ_TIMEOUT, c_read.read(&mut buffer)).await {
+                Ok(Ok(0)) => {
+                    let _ = tokio::time::timeout(WS_WRITE_TIMEOUT, r_write.shutdown()).await;
+                    return Ok::<(), TcpClose>(());
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => return Err(TcpClose::ClientRead),
+                Err(_) => return Err(TcpClose::ClientIdleTimeout),
+            };
+            let chunk = &mut buffer[..n];
+            clt_dec.xor(chunk);
+            tg_enc.xor(chunk);
+            match tokio::time::timeout(WS_WRITE_TIMEOUT, r_write.write_all(chunk)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(TcpClose::UpstreamWrite),
+                Err(_) => return Err(TcpClose::UpstreamTimeout),
+            }
+            if up_bytes.fetch_add(n, Ordering::Relaxed) == 0 {
+                let _ = sent_tx.send(true);
+            }
+            STATS.bytes_up.fetch_add(n as i64, Ordering::Relaxed);
+        }
+    };
+
     let mut reply = trace::ReplyObserver::for_session();
-    let mut delivered = 0;
+    let mut delivered = 0usize;
     let mut framed = false;
     let mut reported_response = false;
     let mut reported_sustained = false;
     let mut transport_error = false;
-    let down = relay_tcp_direction(&mut r_read, &mut c_write, tg_dec, clt_enc, &STATS.bytes_down, |plain| {
-        STATS.bytes_upstream_received.fetch_add(plain.len() as i64, Ordering::Relaxed);
-        reply.observe(plain, |class| {
-            match class {
+    let down = async {
+        let first_response_wait = async {
+            let Some(timeout) = first_response_timeout else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            if !*sent_rx.borrow() {
+                let _ = sent_rx.wait_for(|sent| *sent).await;
+            }
+            tokio::time::sleep(timeout).await;
+        };
+        tokio::pin!(first_response_wait);
+        let mut buffer = vec![0; WS_BRIDGE_CHUNK_SIZE];
+        loop {
+            let read_res = tokio::select! {
+                _ = &mut first_response_wait, if first_response_timeout.is_some() && !reported_response && !transport_error => {
+                    return Err::<(), TcpClose>(TcpClose::FirstResponseTimeout);
+                }
+                res = tokio::time::timeout(BRIDGE_READ_TIMEOUT, r_read.read(&mut buffer)) => res,
+            };
+            let n = match read_res {
+                Ok(Ok(0)) => {
+                    let _ = tokio::time::timeout(WS_WRITE_TIMEOUT, c_write.shutdown()).await;
+                    return Err(TcpClose::UpstreamEof);
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(error)) => {
+                    trace::event("tcp_relay_error", format_args!("side=upstream kind={} errno={:?}", error.kind(), error.raw_os_error()));
+                    return Err(TcpClose::UpstreamRead);
+                }
+                Err(_) => return Err(TcpClose::UpstreamTimeout),
+            };
+            let chunk = &mut buffer[..n];
+            tg_dec.xor(chunk);
+            STATS.bytes_upstream_received.fetch_add(n as i64, Ordering::Relaxed);
+            let mut new_transport_error = None;
+            reply.observe(chunk, |class| match class {
                 trace::ReplyClass::TransportError(code) if !transport_error => {
                     transport_error = true;
                     trace::event("transport_error", format_args!("code={code} after_payload={framed}"));
                     if !framed {
-                        observe(Evidence::TransportError(code));
+                        new_transport_error = Some(code);
                     }
                 }
                 trace::ReplyClass::FramedPayload => framed = true,
-                trace::ReplyClass::InvalidEnvelope => trace::event("transport_envelope_invalid", format_args!("direction=downstream")),
+                trace::ReplyClass::InvalidEnvelope => {
+                    trace::event("transport_envelope_invalid", format_args!("direction=downstream"));
+                }
                 _ => {}
+            });
+            if let Some(code) = new_transport_error {
+                observe(Evidence::TransportError(code));
             }
-        });
-        let next = delivered + plain.len();
-        if framed && !transport_error && !reported_response && next >= 32 {
-            reported_response = true;
-            observe(Evidence::ProtocolResponse);
-            trace::mark_relay();
+            clt_enc.xor(chunk);
+            match tokio::time::timeout(WS_WRITE_TIMEOUT, c_write.write_all(chunk)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    trace::event("tcp_relay_error", format_args!("side=client kind={} errno={:?}", error.kind(), error.raw_os_error()));
+                    return Err(TcpClose::ClientWrite);
+                }
+                Err(_) => return Err(TcpClose::ClientBackpressure),
+            }
+            STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
+            delivered += n;
+            let sent = up_bytes.load(Ordering::Relaxed) > 0;
+            if sent && framed && !transport_error && !reported_response && delivered >= 32 {
+                reported_response = true;
+                observe(Evidence::ProtocolResponse);
+                trace::mark_relay();
+            }
+            if sent && framed && !transport_error && !reported_sustained && delivered >= 32 * 1024 {
+                reported_sustained = true;
+                observe(Evidence::Sustained);
+                trace::mark_relay();
+            }
         }
-        if framed && !transport_error && !reported_sustained && next >= 32 * 1024 {
-            reported_sustained = true;
-            observe(Evidence::Sustained);
-            trace::mark_relay();
-        }
-        delivered = next;
-    });
+    };
+
     let ended = tokio::select! {
         _ = cancel_token.cancelled() => "service_stop",
         result = async { tokio::try_join!(up, down) } => match result {
             Ok(_) => "eof",
-            Err(error) => {
-                trace::event("tcp_relay_error", format_args!("kind={} errno={:?}", error.kind(), error.raw_os_error()));
-                "io_error"
-            }
-        }
+            Err(close) => close.as_str(),
+        },
     };
+    if !reported_response && !transport_error && up_bytes.load(Ordering::Relaxed) > 0 {
+        match ended {
+            "first_response_timeout" | "upstream_timeout" => observe(Evidence::ResponseTimeout),
+            "upstream_eof" | "upstream_read" | "upstream_write" => observe(Evidence::PeerFailure),
+            _ => {}
+        }
+    }
     if reply.incomplete() {
         trace::event("transport_record_incomplete", format_args!("direction=downstream"));
     }
-    trace::event("relay_end", format_args!("transport=tcp reason={ended} down_bytes={delivered}"));
-}
-
-async fn relay_tcp_direction<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    mut decrypt: TrackedStream,
-    mut encrypt: TrackedStream,
-    bytes: &std::sync::atomic::AtomicI64,
-    mut observe: impl FnMut(&[u8]),
-) -> std::io::Result<()>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let mut buffer = vec![0; WS_BRIDGE_CHUNK_SIZE];
-    loop {
-        let n = tokio::time::timeout(BRIDGE_READ_TIMEOUT, reader.read(&mut buffer)).await??;
-        if n == 0 {
-            return tokio::time::timeout(WS_WRITE_TIMEOUT, writer.shutdown()).await?;
-        }
-        let chunk = &mut buffer[..n];
-        decrypt.xor(chunk);
-        observe(chunk);
-        encrypt.xor(chunk);
-        tokio::time::timeout(WS_WRITE_TIMEOUT, writer.write_all(chunk)).await??;
-        bytes.fetch_add(n as i64, Ordering::Relaxed);
-    }
+    trace::event(
+        "relay_end",
+        format_args!(
+            "transport=tcp reason={ended} up_bytes={} down_bytes={delivered}",
+            up_bytes.load(Ordering::Relaxed)
+        ),
+    );
 }
 
 pub async fn bridge_tcp_stream(
@@ -1297,107 +1457,185 @@ async fn serve_core<R, W>(
         candidates.first().map(|candidate| candidate.kind), candidates.len()));
 
     let mut cf_attempts = 0;
-    for candidate in &candidates {
-        if candidate.kind == Route::CfWss && cf_attempts >= CF_ATTEMPTS_PER_SESSION {
-            continue;
-        }
-        let Some(mut route_use) = RouteUse::start(&pools.routes, scope, candidate) else {
-            if scope.epoch != trace::network() { return; }
-            continue;
+    let mut dial_attempts = 0u32;
+    let mut route_cooling = 0u32;
+    let mut route_probing = 0u32;
+    let mut family_cooling = 0u32;
+    let mut family_budget = 0u32;
+    let mut busy_count = 0u32;
+    let mut dial_failed = 0u32;
+    let mut busy_indices: Vec<usize> = Vec::new();
+    let mut pass = 0u8;
+
+    loop {
+        let indices: Vec<usize> = if pass == 0 {
+            (0..candidates.len()).collect()
+        } else {
+            std::mem::take(&mut busy_indices)
         };
-        trace::set_route(candidate.kind);
-        let acquired = tokio::select! {
-            _ = cancel_token.cancelled() => return,
-            _ = trace::network_changed(scope.epoch) => {
+        for idx in indices {
+            let candidate = &candidates[idx];
+            if candidate.kind == Route::CfWss && cf_attempts >= CF_ATTEMPTS_PER_SESSION {
+                continue;
+            }
+            let mut route_use = match RouteUse::start(&pools.routes, scope, candidate) {
+                Ok(route_use) => route_use,
+                Err(SkipReason::NetworkChanged) => return,
+                Err(SkipReason::RouteCooling) => {
+                    route_cooling += 1;
+                    continue;
+                }
+                Err(SkipReason::RouteProbing) => {
+                    route_probing += 1;
+                    continue;
+                }
+                Err(SkipReason::FamilyCooling) => {
+                    family_cooling += 1;
+                    continue;
+                }
+                Err(SkipReason::FamilyBudget) => {
+                    family_budget += 1;
+                    continue;
+                }
+            };
+            trace::set_route(candidate.kind);
+            let acquired = tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                _ = trace::network_changed(scope.epoch) => {
+                    trace::event("route_aborted", format_args!("reason=network_changed"));
+                    return;
+                }
+                result = acquire_candidate(pools, scope, candidate, ws_path) => result,
+            };
+            if scope.epoch != trace::network() {
                 trace::event("route_aborted", format_args!("reason=network_changed"));
                 return;
             }
-            result = acquire_candidate(pools, scope, candidate, ws_path) => result,
-        };
-        if scope.epoch != trace::network() {
-            trace::event("route_aborted", format_args!("reason=network_changed"));
+            let upstream = match acquired {
+                Ok(upstream) => upstream,
+                Err(WsError::NetworkChanged) => return,
+                Err(WsError::Busy) => {
+                    busy_count += 1;
+                    if pass == 0 {
+                        busy_indices.push(idx);
+                    }
+                    continue;
+                }
+                Err(WsError::Canceled) => continue,
+                Err(error) => {
+                    dial_attempts += 1;
+                    dial_failed += 1;
+                    if candidate.kind == Route::CfWss {
+                        cf_attempts += 1;
+                    }
+                    STATS.ws_errors.fetch_add(i64::from(candidate.kind != Route::Tcp), Ordering::Relaxed);
+                    trace::event("candidate_failed", format_args!("kind={:?} host={} error={} class={}",
+                        candidate.kind, trace::allowlisted_host(&candidate.host), error.compact(),
+                        connect_failure_class(&error).as_str()));
+                    route_use.observe_connect_failure(connect_failure_class(&error));
+                    continue;
+                }
+            };
+
+            // After the first write is attempted the init may already be partially on
+            // the wire. All exits below close this client and never use another route.
+            match upstream {
+                Upstream::WebSocket(ws) => {
+                    if ws.network != scope.epoch || scope.epoch != trace::network() {
+                        return;
+                    }
+                    let peer = ws.peer;
+                    route_use.observe(if ws.secure { Evidence::TransportVerified } else { Evidence::Reachable }, peer);
+                    if ws.send(&relay_init).await.is_err() {
+                        route_use.observe(Evidence::PeerFailure, peer);
+                        trace::event("relay_init_failed", format_args!("reason=write"));
+                        return;
+                    }
+                    trace::mark_verified();
+                    trace::event("relay_init_sent", format_args!("route={:?} dc={dc} media={is_media}", candidate.kind));
+                    trace::event("route_pinned", format_args!("kind={:?} host={} dc={dc} media={is_media} test={is_test_dc}",
+                        candidate.kind, trace::allowlisted_host(&candidate.host)));
+                    let splitter = if candidate.kind == Route::WorkerWss { None } else { MsgSplitter::new(&relay_init, proto_int) };
+                    if candidate.kind == Route::DirectWss {
+                        STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let probe_timeout = Some(FIRST_RESPONSE_TIMEOUT);
+                    bridge_ws(conn_read, conn_write, ws, label, dc, is_media, splitter,
+                        clt_decryptor, clt_encryptor, tg_encryptor, tg_decryptor, cancel_token, probe_timeout,
+                        |evidence| {
+                            route_use.observe(evidence, peer);
+                            if evidence == Evidence::ProtocolResponse && candidate.kind == Route::DirectWss && candidate.secure
+                                && scope.epoch == trace::network() && !is_test_dc {
+                                if let Some(target) = direct_target.clone() {
+                                    let pool = pools.ws.clone();
+                                    let host = candidate.host.clone();
+                                    tokio::spawn(async move {
+                                        if scope.epoch == trace::network() {
+                                            let slot = DcSlot { dc, is_media: is_media_int(is_media) };
+                                            pool.clear_refill_failure(scope.epoch, slot).await;
+                                            pool.schedule_refill(slot, target, vec![host], MAX_POOL_SIZE as usize).await;
+                                        }
+                                    });
+                                }
+                            }
+                        }).await;
+                }
+                Upstream::Tcp(mut remote) => {
+                    if scope.epoch != trace::network() { return; }
+                    let peer = remote.peer_addr().ok();
+                    route_use.observe(Evidence::Reachable, peer);
+                    if !matches!(tokio::time::timeout(WS_WRITE_TIMEOUT, remote.write_all(&relay_init)).await, Ok(Ok(()))) {
+                        route_use.observe(Evidence::PeerFailure, peer);
+                        trace::event("relay_init_failed", format_args!("reason=write"));
+                        return;
+                    }
+                    STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
+                    trace::event("relay_init_sent", format_args!("route=Tcp dc={dc} media={is_media}"));
+                    trace::event("route_pinned", format_args!("kind=Tcp dc={dc} media={is_media} test={is_test_dc}"));
+                    bridge_tcp_observed(conn_read, conn_write, remote, clt_decryptor, clt_encryptor,
+                        tg_encryptor, tg_decryptor, cancel_token, Some(FIRST_RESPONSE_TIMEOUT), |evidence| route_use.observe(evidence, peer)).await;
+                }
+            }
             return;
         }
-        let upstream = match acquired {
-            Ok(upstream) => upstream,
-            Err(WsError::NetworkChanged) => return,
-            Err(WsError::Busy | WsError::Canceled) => continue,
-            Err(error) => {
-                if candidate.kind == Route::CfWss {
-                    cf_attempts += 1;
-                }
-                STATS.ws_errors.fetch_add(i64::from(candidate.kind != Route::Tcp), Ordering::Relaxed);
-                trace::event("candidate_failed", format_args!("kind={:?} host={} error={} class={}",
-                    candidate.kind, trace::allowlisted_host(&candidate.host), error.compact(),
-                    connect_failure_class(&error).as_str()));
-                route_use.observe_connect_failure(connect_failure_class(&error));
-                continue;
+        if pass == 0 && !busy_indices.is_empty() {
+            pass = 1;
+            tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                _ = trace::network_changed(scope.epoch) => return,
+                _ = tokio::time::sleep(Duration::from_millis(150)) => {}
             }
-        };
-
-        // After the first write is attempted the init may already be partially on
-        // the wire. All exits below close this client and never use another route.
-        match upstream {
-            Upstream::WebSocket(ws) => {
-                if ws.network != scope.epoch || scope.epoch != trace::network() {
-                    return;
-                }
-                let peer = ws.peer;
-                route_use.observe(if ws.secure { Evidence::TransportVerified } else { Evidence::Reachable }, peer);
-                if ws.send(&relay_init).await.is_err() {
-                    route_use.observe(Evidence::PeerFailure, peer);
-                    trace::event("relay_init_failed", format_args!("reason=write"));
-                    return;
-                }
-                trace::mark_verified();
-                trace::event("relay_init_sent", format_args!("route={:?} dc={dc} media={is_media}", candidate.kind));
-                trace::event("route_pinned", format_args!("kind={:?} host={} dc={dc} media={is_media} test={is_test_dc}",
-                    candidate.kind, trace::allowlisted_host(&candidate.host)));
-                let splitter = if candidate.kind == Route::WorkerWss { None } else { MsgSplitter::new(&relay_init, proto_int) };
-                if candidate.kind == Route::DirectWss {
-                    STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
-                }
-                let probe_timeout = route_use.is_family_probe().then_some(Duration::from_secs(10));
-                bridge_ws(conn_read, conn_write, ws, label, dc, is_media, splitter,
-                    clt_decryptor, clt_encryptor, tg_encryptor, tg_decryptor, cancel_token, probe_timeout,
-                    |evidence| {
-                        route_use.observe(evidence, peer);
-                        if evidence == Evidence::ProtocolResponse && candidate.kind == Route::DirectWss && candidate.secure
-                            && scope.epoch == trace::network() && !is_test_dc {
-                            if let Some(target) = direct_target.clone() {
-                                let pool = pools.ws.clone();
-                                let host = candidate.host.clone();
-                                tokio::spawn(async move {
-                                    if scope.epoch == trace::network() {
-                                        let slot = DcSlot { dc, is_media: is_media_int(is_media) };
-                                        pool.clear_refill_failure(scope.epoch, slot).await;
-                                        pool.schedule_refill(slot, target, vec![host], MAX_POOL_SIZE as usize).await;
-                                    }
-                                });
-                            }
-                        }
-                    }).await;
-            }
-            Upstream::Tcp(mut remote) => {
-                if scope.epoch != trace::network() { return; }
-                let peer = remote.peer_addr().ok();
-                route_use.observe(Evidence::Reachable, peer);
-                if !matches!(tokio::time::timeout(WS_WRITE_TIMEOUT, remote.write_all(&relay_init)).await, Ok(Ok(()))) {
-                    route_use.observe(Evidence::PeerFailure, peer);
-                    trace::event("relay_init_failed", format_args!("reason=write"));
-                    return;
-                }
-                STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
-                trace::event("relay_init_sent", format_args!("route=Tcp dc={dc} media={is_media}"));
-                trace::event("route_pinned", format_args!("kind=Tcp dc={dc} media={is_media} test={is_test_dc}"));
-                bridge_tcp_observed(conn_read, conn_write, remote, clt_decryptor, clt_encryptor,
-                    tg_encryptor, tg_decryptor, cancel_token, |evidence| route_use.observe(evidence, peer)).await;
-            }
+            continue;
         }
-        return;
+        break;
     }
+
+    let primary_reason = if candidates.is_empty() {
+        "no_candidates"
+    } else if dial_failed > 0 {
+        "dial_failed"
+    } else if family_cooling > 0 {
+        "family_cooling"
+    } else if route_cooling > 0 {
+        "route_cooling"
+    } else if busy_count > 0 {
+        "busy"
+    } else if family_budget > 0 {
+        "family_budget"
+    } else if route_probing > 0 {
+        "route_probing"
+    } else {
+        "skipped"
+    };
+    pools.routes.lock().record_exhausted(
+        scope,
+        primary_reason,
+        candidates.len(),
+        dial_attempts,
+        Instant::now(),
+    );
     // An immediate EOF while all routes are on cooldown makes Telegram reconnect in a tight loop.
     tokio::select! {
         _ = cancel_token.cancelled() => return,
@@ -1405,7 +1643,11 @@ async fn serve_core<R, W>(
         _ = tokio::time::sleep_until(failed_session_deadline) => {}
     }
     trace::mark_exhausted();
-    lwarn!("[{}] stage=routes_exhausted dc={} media={} test={}", label, dc, is_media, is_test_dc);
+    lwarn!(
+        "[{}] stage=routes_exhausted dc={} media={} test={} reason={} candidates={} attempts={} route_cooling={} route_probing={} family_cooling={} family_budget={} busy={} dial_failed={}",
+        label, dc, is_media, is_test_dc, primary_reason, candidates.len(), dial_attempts,
+        route_cooling, route_probing, family_cooling, family_budget, busy_count, dial_failed
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,6 +2346,195 @@ mod route_policy_tests {
             Some(Duration::from_millis(100)), |evidence| events.push(evidence)).await;
         assert!(!result);
         assert_eq!(events, [Evidence::ResponseTimeout]);
+    }
+
+    #[tokio::test]
+    async fn ws_idle_without_client_request_does_not_trigger_first_response_timeout() {
+        let (ws, _peer) = crate::ws::tests::loopback_ws().await;
+        let (_client, proxy) = tokio::io::duplex(32);
+        let (read, write) = tokio::io::split(proxy);
+        let cipher = || new_aes_ctr(&[0; 32], &[0; 16]);
+        let cancel = CancellationToken::new();
+        let cancel_soon = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            cancel_soon.cancel();
+        });
+        let mut events = Vec::new();
+        let result = bridge_ws(
+            read, write, ws, "idle".into(), 2, false, None,
+            cipher(), cipher(), cipher(), cipher(), cancel,
+            Some(Duration::from_millis(60)),
+            |evidence| events.push(evidence),
+        )
+        .await;
+        assert!(!result);
+        assert!(events.is_empty(), "idle socket without client request must not record timeout: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn tcp_silent_upstream_after_request_records_response_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 32];
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let remote = TcpStream::connect(addr).await.unwrap();
+        let (mut client, proxy) = tokio::io::duplex(64);
+        client.write_all(b"client-request").await.unwrap();
+        let (read, write) = tokio::io::split(proxy);
+        let cipher = || new_aes_ctr(&[0; 32], &[0; 16]);
+        let mut events = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            bridge_tcp_observed(
+                read, write, remote,
+                cipher(), cipher(), cipher(), cipher(),
+                CancellationToken::new(),
+                Some(Duration::from_millis(100)),
+                |evidence| events.push(evidence),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events, [Evidence::ResponseTimeout]);
+    }
+
+    #[tokio::test]
+    async fn tcp_early_upstream_eof_after_request_records_peer_failure() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 32];
+            let _ = socket.read(&mut buf).await;
+            drop(socket);
+        });
+        let remote = TcpStream::connect(addr).await.unwrap();
+        let (mut client, proxy) = tokio::io::duplex(64);
+        client.write_all(b"client-request").await.unwrap();
+        let (read, write) = tokio::io::split(proxy);
+        let cipher = || new_aes_ctr(&[0; 32], &[0; 16]);
+        let mut events = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            bridge_tcp_observed(
+                read, write, remote,
+                cipher(), cipher(), cipher(), cipher(),
+                CancellationToken::new(),
+                Some(Duration::from_secs(5)),
+                |evidence| events.push(evidence),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events, [Evidence::PeerFailure]);
+    }
+
+    #[tokio::test]
+    async fn tcp_client_write_failure_does_not_record_protocol_response_or_upstream_failure() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 32];
+            let _ = socket.read(&mut buf).await;
+            // Send a valid intermediate-framed 36-byte payload (len=32 + 32 bytes)
+            let mut frame = Vec::with_capacity(36);
+            frame.extend_from_slice(&32u32.to_le_bytes());
+            frame.extend_from_slice(&[0xAB; 32]);
+            let _ = socket.write_all(&frame).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let remote = TcpStream::connect(addr).await.unwrap();
+        let (mut client, proxy) = tokio::io::duplex(64);
+        client.write_all(b"client-request").await.unwrap();
+        drop(client); // Client disconnects before receiving response
+        let (read, write) = tokio::io::split(proxy);
+        let cipher = || new_aes_ctr(&[0; 32], &[0; 16]);
+        let mut events = Vec::new();
+        let session = trace::Session::new(1, 1);
+        trace::SESSION
+            .scope(session, async {
+                trace::set_protocol(PROTO_INTERMEDIATE_INT);
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    bridge_tcp_observed(
+                        read, write, remote,
+                        cipher(), cipher(), cipher(), cipher(),
+                        CancellationToken::new(),
+                        Some(Duration::from_secs(2)),
+                        |evidence| events.push(evidence),
+                    ),
+                )
+                .await
+                .unwrap();
+            })
+            .await;
+        assert!(
+            !events.contains(&Evidence::ProtocolResponse) && !events.contains(&Evidence::PeerFailure),
+            "client write failure must not emit ProtocolResponse or PeerFailure: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_pool_get_skips_stale_socket_and_returns_healthy_second_socket() {
+        let pool = Arc::new(WsPool::new(CancellationToken::new()));
+        let (stale_ws, stale_peer) = crate::ws::tests::loopback_ws().await;
+        drop(stale_peer); // peer closed -> check_idle fails immediately
+
+        let (healthy_ws, mut healthy_peer) = crate::ws::tests::loopback_ws().await;
+        let pong_task = tokio::spawn(async move {
+            // Read client-masked 8-byte PING frame: 2 header bytes + 4 mask bytes + 8 payload bytes = 14 bytes
+            let mut frame = [0u8; 14];
+            healthy_peer.read_exact(&mut frame).await.unwrap();
+            let mask = &frame[2..6];
+            let mut nonce = [0u8; 8];
+            for i in 0..8 {
+                nonce[i] = frame[6 + i] ^ mask[i % 4];
+            }
+            healthy_peer
+                .write_all(&build_frame(OP_PONG, &nonce, false))
+                .await
+                .unwrap();
+        });
+
+        let slot = DcSlot { dc: 2, is_media: 1 };
+        let state = pool.get_slot(slot).await;
+        {
+            let mut q = state.queue.lock().await;
+            q.push_back(PoolEntry { ws: stale_ws, created: now_monotonic() });
+            q.push_back(PoolEntry { ws: healthy_ws, created: now_monotonic() });
+        }
+
+        let got = pool.get(2, true, Some("loopback")).await;
+        assert!(got.is_some(), "pool checkout must skip stale socket and return live second entry");
+        pong_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_pool_evict_stale_epoch_removes_old_network_entries_and_keeps_current() {
+        let pool = Arc::new(WsPool::new(CancellationToken::new()));
+        let (mut old_ws, _old_peer) = crate::ws::tests::loopback_ws().await;
+        let current_epoch = trace::network();
+        old_ws.network = current_epoch.wrapping_add(8);
+        let (cur_ws, _cur_peer) = crate::ws::tests::loopback_ws().await;
+
+        let slot = DcSlot { dc: 4, is_media: 1 };
+        let state = pool.get_slot(slot).await;
+        {
+            let mut q = state.queue.lock().await;
+            q.push_back(PoolEntry { ws: old_ws, created: now_monotonic() });
+            q.push_back(PoolEntry { ws: cur_ws, created: now_monotonic() });
+        }
+
+        pool.evict_stale_epoch(current_epoch).await;
+        let q = state.queue.lock().await;
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].ws.network, current_epoch);
     }
 
     #[test]
